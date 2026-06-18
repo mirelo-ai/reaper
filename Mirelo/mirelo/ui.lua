@@ -1160,7 +1160,6 @@ local function draw_main()
   end
   draw_toast()
   draw_results()
-  draw_modals()
 end
 
 -- ---- public ---------------------------------------------------------------
@@ -1188,6 +1187,18 @@ end
 -- Called once per frame between Begin/End.
 function ui.draw()
   gen.update()
+  -- On the busy -> done transition: refresh credits (the job just spent some) and
+  -- surface a partial-sample failure once, rather than completing silently.
+  local busy = gen.is_busy()
+  if M._was_busy and not busy and gen.state.status == "done" then
+    fetch_me()
+    local failed = gen.state._dl_failed or 0
+    if failed > 0 then
+      toast(string.format("%d of %d samples failed to download", failed, gen.state._dl_total), "info")
+    end
+  end
+  M._was_busy = busy
+
   update_auth()
   if reaper.time_precise() >= M.version_next_check then
     M.version_next_check = reaper.time_precise() + VERSION_RECHECK
@@ -1202,6 +1213,9 @@ function ui.draw()
   else
     draw_main()
   end
+  -- Modals last + unconditionally, so the header's Feedback/Logout work on every
+  -- screen (incl. the blocked screen, where draw_main isn't called).
+  draw_modals()
 end
 
 return ui

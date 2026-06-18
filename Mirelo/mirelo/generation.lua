@@ -14,6 +14,9 @@ local wav = require("mirelo.wav")
 local R = require("mirelo.reaper_io")
 
 local POLL_INTERVAL = 2.0
+-- Give up polling a job that never reaches a terminal state, so a stuck backend
+-- job can't leave the UI on "Generating…" forever.
+local POLL_TIMEOUT_SEC = 600
 local TOTAL_MAX_SEC = 60 -- extend: prefix + new audio cap (SFX_EXTEND_LIMITS v1.6)
 
 local gen = {}
@@ -64,9 +67,11 @@ gen.state = {
   num_samples = 1,
   place_ctx = nil, -- { mode="cursor"|"inpaint", pos, clip_in?, clip_out? }
   _next_poll = 0,
+  _poll_deadline = 0,
   _poll_inflight = false,
   _dl_total = 0,
   _dl_done = 0,
+  _dl_failed = 0,
   _render_file = nil,
   _upload_file = nil,
 }
@@ -80,7 +85,8 @@ local function reset(kind, is_music)
   s.active_clip = nil -- clip snapshot shown by the extender/inpainter while busy
   s._hl = nil; s._original = nil; s._pair = nil
   s.label = nil; s.place_name = nil; s._name_from_output = false
-  s._next_poll = 0; s._poll_inflight = false; s._dl_total = 0; s._dl_done = 0
+  s._next_poll = 0; s._poll_deadline = 0; s._poll_inflight = false
+  s._dl_total = 0; s._dl_done = 0; s._dl_failed = 0
   s._render_file = nil; s._upload_file = nil
 end
 -- Full reset (logout): GC the temp downloads we still own, then drop history.
@@ -144,6 +150,7 @@ local function start_downloads(urls)
   s.message = "Downloading…"
   s._dl_total = #urls
   s._dl_done = 0
+  s._dl_failed = 0
   local stamp = tostring(os.time())
   for i, url in ipairs(urls) do
     counter = counter + 1
@@ -169,6 +176,7 @@ local function start_downloads(urls)
           place_name = s.place_name, pair = s._pair, name = nm, mode = MODE_GROUP[s.kind] or "sfx",
         }
       else
+        s._dl_failed = s._dl_failed + 1
         os.remove(dest) -- curl may have written an error body (e.g. an S3 403 XML)
       end
       s.progress = 90 + math.floor(10 * s._dl_done / s._dl_total)
@@ -212,6 +220,9 @@ local function handle_poll(err, data)
   elseif status == "errored" or status == "failed" then
     fail((data.error and data.error.message) or "generation failed")
   else
+    if reaper.time_precise() > s._poll_deadline then
+      return fail("generation timed out — please try again")
+    end
     if type(data.progress_percent) == "number" then
       s.progress = math.max(s.progress, math.min(89, math.floor(data.progress_percent * 0.89)))
     end
@@ -222,6 +233,7 @@ end
 local function begin_poll(job_id)
   local s = gen.state
   if not s.kind then return end -- state was reset (logout) mid-flight; never poll a nil model
+  s._poll_deadline = reaper.time_precise() + POLL_TIMEOUT_SEC
   s.job_id = job_id
   s.status = "polling"
   s.progress = math.max(s.progress, 2)

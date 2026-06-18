@@ -141,7 +141,10 @@ function render.update()
   end
 end
 
--- Restore settings + abandon any in-flight render (called on shutdown).
+-- Restore settings + abandon any in-flight render (called on shutdown). REAPER
+-- offers no API to cancel an offline render already started by action 42230, so
+-- a render in progress runs to completion; we just stop tracking it (its output
+-- is orphaned in the temp dir and cleaned up like any other temp).
 function render.abort()
   if not pending then return end
   restore(pending.save)
