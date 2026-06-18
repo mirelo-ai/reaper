@@ -1030,9 +1030,12 @@ local function logout()
   store.clear_api_key()
   M.route = "auth"; M.connecting = false; M.credits = nil; M.overage = false
   M.wave = {}; M.play_idx = nil
-  -- net.reset() dropped any in-flight /v2/me, so its callback won't clear this;
-  -- reset it here or the next session's fetch_me would early-return forever.
+  -- net.reset() dropped any in-flight requests, so their callbacks won't run.
+  -- Reset the flags those callbacks would have cleared, or the next session gets
+  -- stuck: fetch_me would early-return forever (blank credits) and the feedback
+  -- modal would stay on "Sending…".
   M.me_inflight = false
+  M.feedback_status = "idle"; M.feedback_error = ""
 end
 
 -- Feedback + disconnect modals (opened from the header).
