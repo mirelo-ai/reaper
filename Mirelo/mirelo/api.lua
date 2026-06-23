@@ -10,7 +10,7 @@ local errors = require("mirelo.errors")
 local api = {}
 
 api.PLUGIN_TYPE = "reaper"
-api.PLUGIN_VERSION = "0.1.0-reascript"
+api.PLUGIN_VERSION = "1.0.0-reascript"
 api.X_CLIENT = "REAPER Plugin v" .. api.PLUGIN_VERSION
 
 -- Set by the UI: invoked when any call fails with an auth error so the app can

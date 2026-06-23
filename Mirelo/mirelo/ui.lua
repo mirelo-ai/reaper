@@ -340,7 +340,9 @@ local function update_auth()
       return
     end
     M.auth_fails = 0
-    if data.status == "ready" and data.apiKey then
+    -- Require a real string key: JSON null decodes to the json.null sentinel
+    -- (a truthy table), so a plain `and data.apiKey` would store a non-string.
+    if data.status == "ready" and type(data.apiKey) == "string" and data.apiKey ~= "" then
       store.set_api_key(data.apiKey)
       M.connecting = false
       M.route = "main"
