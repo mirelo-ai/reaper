@@ -6,29 +6,29 @@
         <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0\fnil Helvetica;}}\f0\fs20 \b Mirelo for REAPER\b0\par \par Generate sound effects and music from a text prompt or the video on your timeline, and extend or inpaint audio clips - all inside REAPER, powered by Mirelo (https://mirelo.ai).\par \par Requires ReaImGui >= 0.9 (install via ReaPack) and curl >= 7.73 (in-box on modern OSes). SWS is optional for in-panel preview.\par}]]></description>
         <link rel="website" href="https://mirelo.ai">Mirelo</link>
       </metadata>
-      <version name="0.1.0" author="Mirelo" time="2026-06-18T16:55:00Z">
+      <version name="1.0.0" author="Mirelo" time="2026-06-23T10:10:00Z">
         <changelog><![CDATA[First release: Text/Video to SFX & Music, Extender, Inpainter; device-nonce
 auth, live credit display, and a startup version gate.]]></changelog>
-        <source main="main" file="mirelo.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/mirelo.lua</source>
-        <source file="mirelo/api.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/mirelo/api.lua</source>
-        <source file="mirelo/errors.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/mirelo/errors.lua</source>
-        <source file="mirelo/generation.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/mirelo/generation.lua</source>
-        <source file="mirelo/json.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/mirelo/json.lua</source>
-        <source file="mirelo/net.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/mirelo/net.lua</source>
-        <source file="mirelo/reaper_io.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/mirelo/reaper_io.lua</source>
-        <source file="mirelo/render.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/mirelo/render.lua</source>
-        <source file="mirelo/store.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/mirelo/store.lua</source>
-        <source file="mirelo/theme.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/mirelo/theme.lua</source>
-        <source file="mirelo/ui.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/mirelo/ui.lua</source>
-        <source file="mirelo/video_coverage.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/mirelo/video_coverage.lua</source>
-        <source file="mirelo/wav.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/mirelo/wav.lua</source>
-        <source file="mirelo/waveform.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/mirelo/waveform.lua</source>
-        <source file="resources/icon-extend.png">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/resources/icon-extend.png</source>
-        <source file="resources/icon-inpaint.png">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/resources/icon-inpaint.png</source>
-        <source file="resources/icon-music.png">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/resources/icon-music.png</source>
-        <source file="resources/icon-sfx.png">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/resources/icon-sfx.png</source>
-        <source file="resources/logo-dark.png">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/resources/logo-dark.png</source>
-        <source file="resources/logo-light.png">https://raw.githubusercontent.com/mirelo-ai/reaper/7c4dc9c1eb4771f51034af14e00471adf2afb9c7/Mirelo/resources/logo-light.png</source>
+        <source main="main" file="mirelo.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/mirelo.lua</source>
+        <source file="mirelo/api.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/mirelo/api.lua</source>
+        <source file="mirelo/errors.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/mirelo/errors.lua</source>
+        <source file="mirelo/generation.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/mirelo/generation.lua</source>
+        <source file="mirelo/json.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/mirelo/json.lua</source>
+        <source file="mirelo/net.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/mirelo/net.lua</source>
+        <source file="mirelo/reaper_io.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/mirelo/reaper_io.lua</source>
+        <source file="mirelo/render.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/mirelo/render.lua</source>
+        <source file="mirelo/store.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/mirelo/store.lua</source>
+        <source file="mirelo/theme.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/mirelo/theme.lua</source>
+        <source file="mirelo/ui.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/mirelo/ui.lua</source>
+        <source file="mirelo/video_coverage.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/mirelo/video_coverage.lua</source>
+        <source file="mirelo/wav.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/mirelo/wav.lua</source>
+        <source file="mirelo/waveform.lua">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/mirelo/waveform.lua</source>
+        <source file="resources/icon-extend.png">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/resources/icon-extend.png</source>
+        <source file="resources/icon-inpaint.png">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/resources/icon-inpaint.png</source>
+        <source file="resources/icon-music.png">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/resources/icon-music.png</source>
+        <source file="resources/icon-sfx.png">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/resources/icon-sfx.png</source>
+        <source file="resources/logo-dark.png">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/resources/logo-dark.png</source>
+        <source file="resources/logo-light.png">https://raw.githubusercontent.com/mirelo-ai/reaper/8b056df3d4adeebafe0fb1be73f70325c13d4b01/Mirelo/resources/logo-light.png</source>
       </version>
     </reapack>
   </category>
