@@ -22,7 +22,7 @@ local M = {
   -- auth
   nonce = nil, connecting = false, auth_msg = "", auth_next = 0, auth_inflight = false,
   -- account
-  credits = nil, email = nil, overage = false, me_inflight = false,
+  capacity = nil, email = nil, me_inflight = false,
   -- version gate
   version_blocked = nil,   -- { message, url } when this build is blocked
   version_notice = nil,    -- { message, url } for a dismissible "update available"
@@ -85,8 +85,11 @@ end
 -- Credit cost: ceil(duration * samples * rate). All v1.6/v1.0 models bill at 10/s.
 local CREDIT_RATE = 10
 local function credits_for(dur, samples) return math.ceil(dur * (samples or 1) * CREDIT_RATE) end
+-- spend_capacity is the answer to exactly this question: the ledger balance,
+-- less credits already committed by jobs in flight, plus any enabled overage
+-- headroom. Nil on an unmetered key, which is never refused.
 local function enough_credits(needed)
-  return M.credits == nil or M.overage or M.credits >= needed
+  return M.capacity == nil or M.capacity >= needed
 end
 
 local function avail_w()
@@ -264,6 +267,15 @@ end
 
 -- ---- auth + account network state ----------------------------------------
 
+-- Every nullable field on /v3/me arrives as JSON null on an unmetered or
+-- organization key, and null decodes to a truthy sentinel — so fold anything
+-- that isn't the expected type back to nil, or the "unknown / unmetered"
+-- branches stop being reachable and commas() is handed a table.
+local function typed(value, kind)
+  if type(value) == kind then return value end
+  return nil
+end
+
 local function fetch_me()
   if M.me_inflight then return end
   M.me_inflight = true
@@ -275,9 +287,11 @@ local function fetch_me()
       return
     end
     if not err and data then
-      M.credits = data.credits_available
-      M.email = data.email
-      M.overage = data.overage_enabled == true
+      -- spend_capacity, not credits_available: the balance reconciles against
+      -- an invoice, the capacity is what the next request may actually spend,
+      -- and this panel only ever asks the second question.
+      M.capacity = typed(data.spend_capacity, "number")
+      M.email = typed(data.email, "string")
     end
   end)
 end
@@ -346,7 +360,7 @@ local function update_auth()
       store.set_api_key(data.apiKey)
       M.connecting = false
       M.route = "main"
-      M.credits = nil
+      M.capacity = nil
       fetch_me()
     elseif data.status == "expired" then
       M.connecting = false
@@ -481,7 +495,11 @@ local function credit_line(needed)
   ImGui.PushFont(ctx, theme.fonts.sm)
   local ok = enough_credits(needed)
   ImGui.PushStyleColor(ctx, ImGui.Col_Text, ok and theme.col.text_muted or theme.col.toast_error)
-  local avail = M.credits ~= nil and ("  •  " .. commas(M.credits) .. " available") or ""
+  -- The capacity, not the ledger balance: this line exists to say whether the
+  -- request will be funded, and those two numbers disagree with overage on or
+  -- with a job of your own in flight. Showing the balance beside a gate that
+  -- reads the capacity is how the line comes to say "available" in red.
+  local avail = M.capacity ~= nil and ("  •  " .. commas(M.capacity) .. " available") or ""
   ImGui.Text(ctx, string.format("Needs %s credit%s%s", commas(needed), needed == 1 and "" or "s", avail))
   ImGui.PopStyleColor(ctx, 1)
   ImGui.PopFont(ctx)
@@ -833,7 +851,7 @@ end
 
 -- Extender: SFX_EXTEND_LIMITS v1.6.
 local EXT_MIN, EXT_MIN_LOOP, EXT_MAX, EXT_MAX_VIDEO, PREFIX_MIN, EXT_TOTAL_MAX =
-  1.0, 2.0, 10.0, 57.0, 3.0, 60.0
+  1.0, 2.0, 57.0, 57.0, 3.0, 60.0
 
 local function draw_extender()
   banner("Seamlessly extend an audio clip with natural-sounding audio.", "info")
@@ -1030,7 +1048,7 @@ local function logout()
   net.reset()
   gen.reset()
   store.clear_api_key()
-  M.route = "auth"; M.connecting = false; M.credits = nil; M.overage = false
+  M.route = "auth"; M.connecting = false; M.capacity = nil
   M.wave = {}; M.play_idx = nil
   -- net.reset() dropped any in-flight requests, so their callbacks won't run.
   -- Reset the flags those callbacks would have cleared, or the next session gets
@@ -1197,9 +1215,13 @@ function ui.draw()
   local busy = gen.is_busy()
   if M._was_busy and not busy and gen.state.status == "done" then
     fetch_me()
-    local failed = gen.state._dl_failed or 0
-    if failed > 0 then
-      toast(string.format("%d of %d samples failed to download", failed, gen.state._dl_total), "info")
+    -- Two ways a batch comes back short, and both are worth saying: v3 can
+    -- deliver fewer variants than were asked for (billed on the count asked
+    -- for either way), and a delivered one can fail to download.
+    local short = (gen.state._dl_failed or 0) + (gen.state._undelivered or 0)
+    if short > 0 then
+      local asked = (gen.state._dl_total or 0) + (gen.state._undelivered or 0)
+      toast(string.format("%d of %d samples didn't come back", short, asked), "info")
     end
   end
   M._was_busy = busy

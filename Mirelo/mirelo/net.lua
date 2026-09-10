@@ -121,6 +121,8 @@ end
 --   headers     array of "Name: Value" strings
 --   body        string body sent verbatim (e.g. JSON)
 --   upload_file path to stream as the request body (PUT to signed URL)
+--   form        ordered array of { name, value } text parts (multipart POST)
+--   form_file   path sent as the last part, named "file"
 --   download_to path to write the response body to (binary download)
 --   timeout     seconds (default 60)
 --   label       string for diagnostics
@@ -164,6 +166,29 @@ function net.request(opts)
     -- The user's own file path; a literal quote in it would otherwise break the
     -- config line (our generated output/done paths can't contain one).
     add('upload-file = "' .. cfg_escape(fwd(opts.upload_file)) .. '"')
+  elseif opts.form or opts.form_file then
+    -- A presigned multipart POST. Every text part is written before the file
+    -- part, because storage ignores anything that follows the file.
+    --
+    -- `form-string` and not `form`: curl reads a leading `@` or `<` in a `form`
+    -- value as a filename to inline and a `;` as a `;type=` clause, either of
+    -- which silently rewrites a signed policy value into something storage will
+    -- refuse. `form-string` sends the value verbatim.
+    for _, part in ipairs(opts.form or {}) do
+      add('form-string = "' .. cfg_escape(part.name) .. "=" .. cfg_escape(part.value) .. '"')
+    end
+    if opts.form_file then
+      -- The filename is quoted for curl as well as for the config line: an
+      -- unquoted `@path` splits on `,` (multiple files) and on `;` (a type
+      -- clause), and the user's own clip is one of the files uploaded here. A
+      -- literal quote in the path cannot be expressed inside curl's quoting, so
+      -- it is refused rather than sent mangled.
+      local path = fwd(opts.form_file)
+      if path:find('"', 1, true) then
+        return abort("cannot upload a file whose path contains a quote: " .. path)
+      end
+      add('form = "file=@\\"' .. cfg_escape(path) .. '\\""')
+    end
   end
 
   add('output = "' .. fwd(body_path) .. '"')

@@ -1,5 +1,5 @@
 -- @description Mirelo — AI sound effects & music for REAPER
--- @version 1.0.0
+-- @version 1.1.0
 -- @author Mirelo
 -- @link Website https://mirelo.ai
 -- @provides
@@ -19,8 +19,11 @@
 --
 --   Run the "Mirelo" action to open the dockable window, then connect your account.
 -- @changelog
---   First release: Text/Video to SFX & Music, Extender, Inpainter; device-nonce
---   auth, live credit display, and a startup version gate.
+--   - A generation where only some samples come back now gives you the ones that worked, and says how many did not arrive. Before, one bad sample failed the whole batch.
+--   - Refusals name the setting that was wrong, and say when you already have several generations running rather than blaming your credits.
+--   - The credit line shows what you can spend right now, which is lower than your balance while your own generations are still running.
+--   - A download whose link expired is retried on a fresh one instead of losing the sample.
+--   - Sound effects, video-to-sfx, the extender and the inpainter now run on Mirelo's v3 API. Music is unchanged.
 
 -- Mirelo for REAPER — pure ReaScript + ReaImGui edition.
 -- Single-script companion: no Electron, no bridge process, no installer.
@@ -28,6 +31,13 @@
 --
 -- The @version above tracks the base of api.PLUGIN_VERSION (the variant-tagged
 -- string sent to /plugin/check-version); bump both together on a release.
+--
+-- The changelog block above is what ReaPack shows the user, and
+-- build-reapack.sh strips the leading comment indent off every line it takes.
+-- So one item per line: a wrapped one lands flush left and the list stops
+-- reading as a list. Keep the literal header tag out of prose down here too --
+-- the extractor restarts on any line that begins with it, which silently pulls
+-- the rest of this file into the published changelog.
 --
 -- Requirements: ReaImGui (cfillion) >= 0.9 via ReaPack, and curl >= 7.73
 -- (in-box on Windows 10 1803+, macOS, modern Linux). SWS is optional (enables

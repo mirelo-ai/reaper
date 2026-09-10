@@ -72,6 +72,7 @@ gen.state = {
   _dl_total = 0,
   _dl_done = 0,
   _dl_failed = 0,
+  _undelivered = 0,
   _render_file = nil,
   _upload_file = nil,
 }
@@ -86,7 +87,7 @@ local function reset(kind, is_music)
   s._hl = nil; s._original = nil; s._pair = nil
   s.label = nil; s.place_name = nil; s._name_from_output = false
   s._next_poll = 0; s._poll_deadline = 0; s._poll_inflight = false
-  s._dl_total = 0; s._dl_done = 0; s._dl_failed = 0
+  s._dl_total = 0; s._dl_done = 0; s._dl_failed = 0; s._undelivered = 0
   s._render_file = nil; s._upload_file = nil
 end
 -- Full reset (logout): GC the temp downloads we still own, then drop history.
@@ -143,27 +144,48 @@ local function ext_from_url(url)
   return "wav"
 end
 
-local function start_downloads(urls)
+-- Music is the one family v3 has no equivalent for, so its jobs are still v2
+-- jobs: a different create field for the id, and a different poll body.
+local function is_v3_kind(kind)
+  local model = kind and api.MODELS[kind] or nil
+  return model ~= nil and model.v3 ~= nil
+end
+
+-- v3 answers a create with the job envelope's `id`; v2 with `job_id`.
+local function job_id_of(data)
+  if type(data) ~= "table" then return nil end
+  local id = data.id or data.job_id
+  return type(id) == "string" and id or nil
+end
+
+-- A usable upload ticket: the id the generation will reference, the URL to POST
+-- to, and the policy fields that authorize it.
+local function asset_ticket(data)
+  if type(data) ~= "table" then return nil end
+  if type(data.id) ~= "string" or type(data.upload_url) ~= "string" then return nil end
+  if type(data.fields) ~= "table" then return nil end
+  return data
+end
+
+-- files: entries as api.result_files describes them — url, and optionally ext,
+-- expires_at and the output/variant position it was found at.
+local function start_downloads(files)
   local s = gen.state
   local job = epoch
   s.status = "downloading"
   s.message = "Downloading…"
-  s._dl_total = #urls
+  s._dl_total = #files
   s._dl_done = 0
   s._dl_failed = 0
   local stamp = tostring(os.time())
-  for i, url in ipairs(urls) do
+  for i, file in ipairs(files) do
     counter = counter + 1
     local dir, sep = out_dir()
-    local dest = string.format("%s%smirelo_%s_%s_%d.%s", dir, sep, s.kind, stamp, counter, ext_from_url(url))
-    api.download(url, dest, function(derr)
-      -- Bail if this batch was torn down (logout) or superseded by a newer job.
-      -- The epoch check also covers the case where a sibling download already
-      -- failed (status left "error") while others were still in flight.
-      if epoch ~= job then
-        os.remove(dest) -- the file may have landed; no card will reference it
-        return
-      end
+    local dest = string.format("%s%smirelo_%s_%s_%d.%s", dir, sep, s.kind, stamp, counter,
+      file.ext or ext_from_url(file.url))
+    local refreshed = false
+
+    local function settle(derr)
       s._dl_done = s._dl_done + 1
       if not derr then
         next_id = next_id + 1
@@ -172,7 +194,7 @@ local function start_downloads(urls)
         local nm = s._name_from_output and (dest:match("[^/\\]+$"))
           or (s.num_samples > 1 and (s.label .. " " .. i) or s.label)
         s.results[#s.results + 1] = {
-          id = next_id, path = dest, url = url, index = i, hi = s._hl, place = s.place_ctx,
+          id = next_id, path = dest, url = file.url, index = i, hi = s._hl, place = s.place_ctx,
           place_name = s.place_name, pair = s._pair, name = nm, mode = MODE_GROUP[s.kind] or "sfx",
         }
       else
@@ -200,8 +222,117 @@ local function start_downloads(urls)
           s.status = "done"; s.progress = 100; s.message = "Done"
         end
       end
-    end)
+    end
+
+    local function attempt(url)
+      api.download(url, dest, function(derr)
+        -- Bail if this batch was torn down (logout) or superseded by a newer job.
+        -- The epoch check also covers the case where a sibling download already
+        -- failed (status left "error") while others were still in flight.
+        if epoch ~= job then
+          os.remove(dest) -- the file may have landed; no card will reference it
+          return
+        end
+        -- A link that has already died is recoverable rather than a lost sample:
+        -- v3 times url_expires_at from the read, so polling the job again
+        -- re-signs it. Once per file, so a download failing for any other reason
+        -- cannot loop.
+        if derr and not refreshed and file.expires_at and os.time() >= file.expires_at then
+          refreshed = true
+          return api.poll_job(s.kind, s.job_id, function(perr, pdata)
+            if epoch ~= job then
+              os.remove(dest)
+              return
+            end
+            local fresh = (not perr) and api.result_file_at(pdata, file.output_index, file.index) or nil
+            if not fresh then return settle(derr) end
+            attempt(fresh.url)
+          end)
+        end
+        settle(derr)
+      end)
+    end
+
+    attempt(file.url)
   end
+end
+
+-- Statuses a v3 job can end on with no audio, and what to say when the job
+-- itself reported nothing about why.
+local V3_DEAD_END = {
+  failed = "generation failed",
+  canceled = "the generation was canceled",
+  expired = "the generation expired before it finished — please try again",
+}
+
+local function handle_v3_poll(data)
+  local s = gen.state
+  local status = data.status
+  if status == "succeeded" or status == "partially_succeeded" then
+    -- partially_succeeded means some variants came back and some did not, so
+    -- show the samples that worked instead of dropping the whole batch.
+    local files = api.result_files(data)
+    if #files == 0 then
+      return fail(api.job_failure(data) or "job succeeded but returned no audio")
+    end
+    -- The shortfall has to be counted here, not inferred from the cards: the
+    -- job is billed on the count that was asked for whatever came back, so a
+    -- batch that quietly returns fewer is audio the user paid for and is not
+    -- told about. Downloads that then fail are counted separately.
+    s._undelivered = math.max(0, api.result_variants_requested(data) - #files)
+    cleanup_temps()
+    s.progress = 90
+    return start_downloads(files)
+  end
+  local dead_end = V3_DEAD_END[status]
+  if dead_end then return fail(api.job_failure(data) or dead_end) end
+  -- The status list is open and a state we don't recognise has to keep polling
+  -- rather than fail, because a new one marks a pipeline stage rather than a new
+  -- outcome. `completed_at` is what catches the other case: it is null while a
+  -- job is queued or running and a timestamp once it is final, so a job that
+  -- finished under a name this build doesn't know stops here instead of running
+  -- the poll deadline down.
+  if type(data.completed_at) == "string" then
+    return fail(api.job_failure(data)
+      or "the generation finished in a state this version doesn't understand — please update the plugin")
+  end
+  if reaper.time_precise() > s._poll_deadline then
+    return fail("generation timed out — please try again")
+  end
+  -- v3 reports progress as a 0..1 fraction, and drops it once the job is final.
+  if type(data.progress) == "number" then
+    s.progress = math.max(s.progress, math.min(89, math.floor(data.progress * 89)))
+  end
+  s._next_poll = reaper.time_precise() + POLL_INTERVAL
+end
+
+-- Music only: one flat list of URLs and a whole-number percent.
+local function handle_v2_poll(data)
+  local s = gen.state
+  local status = data.status
+  if status == "succeeded" or status == "completed" then
+    local urls = (data.result and data.result.result_urls) or data.result_urls
+    if not urls or #urls == 0 then return fail("job succeeded but returned no audio") end
+    cleanup_temps()
+    s.progress = 90
+    -- Deliberately no expires_at: v2 states no link lifetime, and that absence
+    -- is what keeps these files out of the expired-link refresh, which re-polls
+    -- and matches on an output/variant position a v2 result does not have. Give
+    -- one of these an expiry and the refresh would fire and never match.
+    local files = {}
+    for i, url in ipairs(urls) do files[i] = { url = url } end
+    return start_downloads(files)
+  end
+  if status == "errored" or status == "failed" then
+    return fail((data.error and data.error.message) or "generation failed")
+  end
+  if reaper.time_precise() > s._poll_deadline then
+    return fail("generation timed out — please try again")
+  end
+  if type(data.progress_percent) == "number" then
+    s.progress = math.max(s.progress, math.min(89, math.floor(data.progress_percent * 0.89)))
+  end
+  s._next_poll = reaper.time_precise() + POLL_INTERVAL
 end
 
 local function handle_poll(err, data)
@@ -210,24 +341,8 @@ local function handle_poll(err, data)
   if s.status ~= "polling" then return end -- a reset (logout) dropped this job; ignore the stale response
   if err then return fail(err) end
   if not data then return fail("empty poll response") end
-  local status = data.status
-  if status == "succeeded" or status == "completed" then
-    local urls = (data.result and data.result.result_urls) or data.result_urls
-    if not urls or #urls == 0 then return fail("job succeeded but returned no audio") end
-    cleanup_temps()
-    s.progress = 90
-    start_downloads(urls)
-  elseif status == "errored" or status == "failed" then
-    fail((data.error and data.error.message) or "generation failed")
-  else
-    if reaper.time_precise() > s._poll_deadline then
-      return fail("generation timed out — please try again")
-    end
-    if type(data.progress_percent) == "number" then
-      s.progress = math.max(s.progress, math.min(89, math.floor(data.progress_percent * 0.89)))
-    end
-    s._next_poll = reaper.time_precise() + POLL_INTERVAL
-  end
+  if is_v3_kind(s.kind) then return handle_v3_poll(data) end
+  return handle_v2_poll(data)
 end
 
 local function begin_poll(job_id)
@@ -257,8 +372,9 @@ function gen.start_text(kind, params, captured_pos)
   api.submit_job(kind, params, function(err, data)
     if epoch ~= job then return end
     if err then return fail(err) end
-    if not data or not data.job_id then return fail("no job id returned") end
-    begin_poll(data.job_id)
+    local job_id = job_id_of(data)
+    if not job_id then return fail("no job id returned") end
+    begin_poll(job_id)
   end)
 end
 
@@ -282,19 +398,21 @@ function gen.start_video(kind, params, captured_pos, range)
     api.create_asset("video/mp4", function(aerr, adata)
       if epoch ~= job then return end
       if aerr then return fail(aerr) end
-      if not adata or not adata.upload_url or not adata.asset_id then return fail("asset reservation failed") end
-      api.upload_asset(adata.upload_url, path, "video/mp4", function(uerr)
+      local ticket = asset_ticket(adata)
+      if not ticket then return fail("asset reservation failed") end
+      api.upload_asset(ticket, path, function(uerr)
         if epoch ~= job then return end
         if uerr then return fail("video upload failed: " .. uerr) end
         cleanup_temps()
         s.status = "submitting"; s.message = "Submitting…"; s.progress = 45
         local dms = params.duration_ms or math.floor((duration or range.len or 0) * 1000)
-        api.submit_video(kind, adata.asset_id, { duration_ms = dms, num_samples = s.num_samples },
+        api.submit_video(kind, ticket.id, { duration_ms = dms, num_samples = s.num_samples },
           function(serr, sdata)
             if epoch ~= job then return end
             if serr then return fail(serr) end
-            if not sdata or not sdata.job_id then return fail("no job id returned") end
-            begin_poll(sdata.job_id)
+            local job_id = job_id_of(sdata)
+            if not job_id then return fail("no job id returned") end
+            begin_poll(job_id)
           end)
       end)
     end)
@@ -328,27 +446,30 @@ local function start_extend_video(s, opts, clip, audio_file, prefix_dur, auto_tr
     api.create_asset("audio/wav", function(ae, ad)
       if epoch ~= job then return end
       if ae then return fail(ae) end
-      if not ad or not ad.upload_url or not ad.asset_id then return fail("asset reservation failed") end
-      api.upload_asset(ad.upload_url, audio_file, "audio/wav", function(ue)
+      local audio_ticket = asset_ticket(ad)
+      if not audio_ticket then return fail("asset reservation failed") end
+      api.upload_asset(audio_ticket, audio_file, function(ue)
         if epoch ~= job then return end
         if ue then return fail("audio upload failed: " .. ue) end
         s.message = "Uploading video…"; s.progress = 45
         api.create_asset("video/mp4", function(ve, vd)
           if epoch ~= job then return end
           if ve then return fail(ve) end
-          if not vd or not vd.upload_url or not vd.asset_id then return fail("asset reservation failed") end
-          api.upload_asset(vd.upload_url, vpath, "video/mp4", function(uve)
+          local video_ticket = asset_ticket(vd)
+          if not video_ticket then return fail("asset reservation failed") end
+          api.upload_asset(video_ticket, vpath, function(uve)
             if epoch ~= job then return end
             if uve then return fail("video upload failed: " .. uve) end
             cleanup_temps()
             s.status = "submitting"; s.message = "Submitting…"; s.progress = 55
-            api.submit_extend_video(ad.asset_id, vd.asset_id, {
+            api.submit_extend_video(audio_ticket.id, video_ticket.id, {
               append_duration_ms = math.floor(opts.extension_seconds * 1000), num_samples = 1,
             }, function(se, sdata)
               if epoch ~= job then return end
               if se then return fail(se) end
-              if not sdata or not sdata.job_id then return fail("no job id returned") end
-              begin_poll(sdata.job_id)
+              local job_id = job_id_of(sdata)
+              if not job_id then return fail("no job id returned") end
+              begin_poll(job_id)
             end)
           end)
         end)
@@ -409,20 +530,22 @@ function gen.start_extend(opts, clip)
   api.create_asset("audio/wav", function(aerr, adata)
     if epoch ~= job then return end
     if aerr then return fail(aerr) end
-    if not adata or not adata.upload_url or not adata.asset_id then return fail("asset reservation failed") end
-    api.upload_asset(adata.upload_url, up, "audio/wav", function(uerr)
+    local ticket = asset_ticket(adata)
+    if not ticket then return fail("asset reservation failed") end
+    api.upload_asset(ticket, up, function(uerr)
       if epoch ~= job then return end
       cleanup_temps()
       if uerr then return fail("upload failed: " .. uerr) end
       s.status = "submitting"; s.message = "Submitting…"; s.progress = 45
-      api.submit_extend(adata.asset_id, {
+      api.submit_extend(ticket.id, {
         append_duration_ms = math.floor(opts.extension_seconds * 1000),
         num_samples = 1, loop = opts.loop,
       }, function(serr, sdata)
         if epoch ~= job then return end
         if serr then return fail(serr) end
-        if not sdata or not sdata.job_id then return fail("no job id returned") end
-        begin_poll(sdata.job_id)
+        local job_id = job_id_of(sdata)
+        if not job_id then return fail("no job id returned") end
+        begin_poll(job_id)
       end)
     end)
   end)
@@ -465,18 +588,20 @@ function gen.start_inpaint(clip)
   api.create_asset(content_type, function(aerr, adata)
     if epoch ~= job then return end
     if aerr then return fail(aerr) end
-    if not adata or not adata.upload_url or not adata.asset_id then return fail("asset reservation failed") end
-    api.upload_asset(adata.upload_url, clip.source_file, content_type, function(uerr)
+    local ticket = asset_ticket(adata)
+    if not ticket then return fail("asset reservation failed") end
+    api.upload_asset(ticket, clip.source_file, function(uerr)
       if epoch ~= job then return end
       if uerr then return fail("upload failed: " .. uerr) end
       s.status = "submitting"; s.message = "Submitting…"; s.progress = 45
-      api.submit_inpaint(adata.asset_id, {
+      api.submit_inpaint(ticket.id, {
         segment_start_ms = seg_start_ms, segment_end_ms = seg_end_ms, num_samples = 1,
       }, function(serr, sdata)
         if epoch ~= job then return end
         if serr then return fail(serr) end
-        if not sdata or not sdata.job_id then return fail("no job id returned") end
-        begin_poll(sdata.job_id)
+        local job_id = job_id_of(sdata)
+        if not job_id then return fail("no job id returned") end
+        begin_poll(job_id)
       end)
     end)
   end)
