@@ -23,6 +23,16 @@ local M = {
   nonce = nil, connecting = false, auth_msg = "", auth_next = 0, auth_inflight = false,
   -- account
   capacity = nil, email = nil, me_inflight = false,
+  -- model registry (GET /v3/models), fetched once per session at sign-in.
+  -- Same nil-means-unknown convention as M.capacity: M.limits is set only once
+  -- a fetch has actually landed.
+  limits = nil,
+  models_status = "idle", -- idle | loading | ready | error
+  models_inflight = false,
+  models_attempt = 0,
+  models_deadline = 0,  -- time_precise() the whole budget expires at
+  models_retry_at = 0,  -- time_precise() the next attempt may start
+  models_epoch = 0,     -- bumped to disown a reply from an abandoned fetch
   -- version gate
   version_blocked = nil,   -- { message, url } when this build is blocked
   version_notice = nil,    -- { message, url } for a dismissible "update available"
@@ -49,13 +59,31 @@ local M = {
   wave = {}, -- path -> {bars, real}
 }
 
--- Per-endpoint duration bounds (seconds), from packages/shared/audio-constants.
-local DUR_LIMITS = {
-  sfx         = { min = 1.0, max = 60.0 },
-  music       = { min = 3.0, max = 120.0 },
-  video_sfx   = { min = 1.0, max = 600.0 },
-  video_music = { min = 3.0, max = 120.0 },
+-- Duration bounds (seconds) for the two music endpoints, and how many samples
+-- they take. There is no music family in v3, so `GET /v3/models` says nothing
+-- about music and these stay compiled in; the sfx and video-to-sfx bounds that
+-- used to sit beside them now come off the registry.
+local MUSIC_LIMITS = {
+  music       = { min = 3.0, max = 120.0, samples = 4 },
+  video_music = { min = 3.0, max = 120.0, samples = 4 },
 }
+
+-- Floors this plugin deliberately holds ABOVE what the API accepts.
+--
+-- The registry can only publish capability. These two are product choices, and
+-- @studio/shared/audio-constants is where they are argued: SFX_TEXT_DURATION_
+-- SECONDS and SFX_EXTEND_LIMITS both sit above their API counterparts so
+-- "interactive surfaces keep enough generated material for a smooth
+-- transition". The effective bound is whichever of the two is stricter, folded
+-- in where the registry lands.
+local PRODUCT_FLOORS = { sfx = 1.0, extend_loop = 2.0 }
+
+-- Extender bounds the plugin holds itself, because the registry has no field
+-- for either. PREFIX_MIN is a property of the caller's own clip — the model
+-- needs some audio ahead of the join to condition on — and EXT_TOTAL_MAX
+-- bounds prefix + extension together, a total v3 publishes no key for. The
+-- new-audio bounds beside them do come from `GET /v3/models`.
+local PREFIX_MIN, EXT_TOTAL_MAX = 3.0, 60.0
 
 -- Map (mode, source) -> endpoint kind used by generation/api.
 local function endpoint_kind()
@@ -63,6 +91,26 @@ local function endpoint_kind()
     return M.mode == "music" and "video_music" or "video_sfx"
   end
   return M.mode
+end
+
+-- Duration bounds for one endpoint kind. nil while the registry hasn't
+-- answered, which only happens on a kind the registry covers.
+local function dur_limits(kind)
+  return MUSIC_LIMITS[kind] or (M.limits and M.limits.duration[kind])
+end
+
+-- The `num_variants` ceiling for one endpoint kind.
+local function samples_max(kind)
+  local music = MUSIC_LIMITS[kind]
+  if music then return music.samples end
+  return (M.limits and M.limits.samples[kind]) or 1
+end
+
+-- A bound as text. These come off the registry now, so a bound is no longer
+-- guaranteed to be whole and "%.0f" would print 0.5s as "0s".
+local function secs_text(n)
+  if n == math.floor(n) then return string.format("%.0f", n) end
+  return string.format("%.1f", n)
 end
 
 -- ---- small helpers --------------------------------------------------------
@@ -296,6 +344,98 @@ local function fetch_me()
   end)
 end
 
+-- ---- model registry ------------------------------------------------------
+-- The generation form's bounds all come from `GET /v3/models`, so this call
+-- gates the form. There is deliberately no fallback to compiled numbers: a
+-- stale bound silently refuses a request the API would have accepted, which is
+-- worse than a visible error, so an unreachable API means no form at all.
+
+local TUNING = api.MODELS_TUNING
+
+local start_models_attempt -- forward declaration: the callback reschedules it
+
+local function fetch_models()
+  if M.models_status == "loading" or M.models_status == "ready" then return end
+  M.models_epoch = M.models_epoch + 1
+  M.models_status = "loading"
+  M.models_attempt = 0
+  M.models_deadline = reaper.time_precise() + TUNING.budget
+  M.models_retry_at = 0
+  start_models_attempt()
+end
+
+start_models_attempt = function()
+  M.models_inflight = true
+  M.models_attempt = M.models_attempt + 1
+  local epoch = M.models_epoch
+  -- The attempts and their backoffs are sized to fill the budget exactly, so
+  -- the frame the tick costs between them pushes the last attempt's own cap
+  -- past the deadline. Hand it what is actually left instead: the reply would
+  -- be refused anyway, and this stops a detached curl waiting for it. The
+  -- floor is unreachable — no caller starts an attempt with less than
+  -- min_attempt left — and exists only because curl reads a max-time of 0 as
+  -- no limit at all.
+  local remaining = M.models_deadline - reaper.time_precise()
+  local timeout = math.max(TUNING.min_attempt, math.min(TUNING.timeout, remaining))
+  api.models(function(err, data, _status, category)
+    -- The fetch this reply belongs to was abandoned (budget spent, or a logout
+    -- tore the session down), so its state is gone and must not be revived.
+    if epoch ~= M.models_epoch then return end
+    M.models_inflight = false
+    local limits = (not err) and api.model_limits(data, api.V3_MODEL) or nil
+    if limits then
+      -- Fold the bounds the plugin holds itself in here, once, so every read
+      -- site downstream sees a single effective bound instead of re-deciding.
+      limits.duration.sfx.min = math.max(limits.duration.sfx.min, PRODUCT_FLOORS.sfx)
+      limits.extend.min_with_loop =
+        math.max(limits.extend.min_with_loop, PRODUCT_FLOORS.extend_loop)
+      -- The append ceiling is bounded by the plugin's own arithmetic as well:
+      -- generation.lua trims the prefix to EXT_TOTAL_MAX less the extension, so
+      -- an extension past EXT_TOTAL_MAX - PREFIX_MIN leaves too little audio
+      -- ahead of the join for the model to condition on, and the request is
+      -- refused after the upload. The published ceiling is exactly that today,
+      -- and the whole point of reading it is that it need not stay that way.
+      limits.extend.max = math.min(limits.extend.max, EXT_TOTAL_MAX - PREFIX_MIN)
+      M.limits = limits
+      M.models_status = "ready"
+      return
+    end
+    -- A 200 that didn't carry the bounds is as unusable as no answer, and no
+    -- retry fixes it, so it fails now rather than after the whole ladder.
+    if not (err and api.models_retryable(category)) or M.models_attempt >= TUNING.attempts then
+      M.models_status = "error"
+      return
+    end
+    M.models_retry_at = reaper.time_precise() + TUNING.backoff
+  end, timeout)
+end
+
+-- TUNING.budget is a deadline polled here rather than a timeout on a promise:
+-- Lua has neither, and net.request is a detached curl this same tick watches
+-- for a completion marker. It also has to bound the whole run independently of
+-- curl's own per-attempt cap, because net gives a request a grace period over
+-- that cap for the case where curl is missing and no marker ever arrives.
+--
+-- ui.draw drains net before calling this, so a reply that landed in the same
+-- frame the deadline trips still counts.
+local function update_models()
+  if M.models_status ~= "loading" then return end
+  local now = reaper.time_precise()
+  if now >= M.models_deadline then
+    M.models_epoch = M.models_epoch + 1 -- a late reply must not revive the form
+    M.models_inflight = false
+    M.models_status = "error"
+    return
+  end
+  -- Only start an attempt the budget can still hold. A retry can come due with
+  -- a sliver left, and one started there outlives the deadline without ever
+  -- being able to answer inside it.
+  if not M.models_inflight and now >= M.models_retry_at
+    and M.models_deadline - now >= TUNING.min_attempt then
+    start_models_attempt()
+  end
+end
+
 -- Re-check every 24h while the plugin stays open (matches usePluginVersionCheck).
 local VERSION_RECHECK = 24 * 60 * 60
 local function check_version()
@@ -362,6 +502,7 @@ local function update_auth()
       M.route = "main"
       M.capacity = nil
       fetch_me()
+      fetch_models()
     elseif data.status == "expired" then
       M.connecting = false
       M.auth_msg = "Connection expired. Try again."
@@ -439,7 +580,7 @@ end
 -- Returns dur (clamped), raw_len, lim, ts0, ts1 for the given endpoint kind.
 local function duration_clamped(kind)
   local ts0, ts1, len = R.time_selection()
-  local lim = DUR_LIMITS[kind]
+  local lim = dur_limits(kind)
   local dur = len > 0 and clamp(len, lim.min, lim.max) or 0
   return dur, len, lim, ts0, ts1
 end
@@ -479,6 +620,36 @@ local function banner(text, kind)
   ImGui.EndChild(ctx)
   ImGui.PopStyleVar(ctx, 2)
   ImGui.PopStyleColor(ctx, 2)
+end
+
+-- Three pulsing dots, drawn with the same DrawList primitives the tab icons
+-- use, so the loading state needs no ReaImGui surface the rest of the UI
+-- doesn't already depend on.
+local function loading_dots()
+  local dl = ImGui.GetWindowDrawList(ctx)
+  local x, y = ImGui.GetCursorScreenPos(ctx)
+  local w = avail_w()
+  local t = reaper.time_precise()
+  local cx = x + w / 2 - 14
+  for i = 0, 2 do
+    local lift = math.max(0, math.sin(((t * 1.6 - i * 0.18) % 1.0) * math.pi))
+    -- The muted-text token with its alpha swapped for the pulse, so the dots
+    -- stay on-palette without a colour of their own.
+    local col = (theme.col.text_muted & 0xFFFFFF00) | math.floor(80 + 175 * lift)
+    ImGui.DrawList_AddCircleFilled(dl, cx + i * 14, y + 5, 3.5, col)
+  end
+  ImGui.Dummy(ctx, w, 12)
+end
+
+-- A muted line centred in the content width.
+local function centered_note(text)
+  ImGui.PushFont(ctx, theme.fonts.sm)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Text, theme.col.text_muted)
+  local tw = ImGui.CalcTextSize(ctx, text)
+  ImGui.SetCursorPosX(ctx, ImGui.GetCursorPosX(ctx) + math.max(0, (avail_w() - tw) / 2))
+  ImGui.Text(ctx, text)
+  ImGui.PopStyleColor(ctx, 1)
+  ImGui.PopFont(ctx)
 end
 
 -- Small amber explanatory line (e.g. why a checkbox is disabled).
@@ -606,23 +777,27 @@ local function draw_form()
   elseif is_video and video_count == 0 then
     banner("No video in the selected range. Move the range over a video clip.", "warn")
   elseif too_short then
-    banner(string.format("Range too short — select at least %.0fs.", lim.min), "warn")
+    banner(string.format("Range too short — select at least %ss.", secs_text(lim.min)), "warn")
   elseif too_long then
-    banner(string.format("Range too long — max %.0fs for this model.", lim.max), "warn")
+    banner(string.format("Range too long — max %ss for this model.", secs_text(lim.max)), "warn")
   else
     ImGui.PushFont(ctx, theme.fonts.sm)
     ImGui.PushStyleColor(ctx, ImGui.Col_Text, theme.col.text_muted)
     if is_video then
       ImGui.Text(ctx, string.format("Range: %s -> %s  (%.1fs)", R.format_tc(ts0), R.format_tc(ts1), dur))
     else
-      ImGui.Text(ctx, string.format("Duration: %.1fs  (from time selection, %.0f-%.0fs)", dur, lim.min, lim.max))
+      ImGui.Text(ctx, string.format("Duration: %.1fs  (from time selection, %s-%ss)",
+        dur, secs_text(lim.min), secs_text(lim.max)))
     end
     ImGui.PopStyleColor(ctx, 1)
     ImGui.PopFont(ctx)
   end
   ImGui.Dummy(ctx, 0, theme.space.gap_xs)
 
-  -- Number of generations.
+  -- Number of generations. The count carries across a mode switch, so it is
+  -- clamped to the kind now selected rather than only bounded by the stepper.
+  local max_samples = samples_max(kind)
+  M.num_samples = clamp(M.num_samples, 1, max_samples)
   ImGui.PushFont(ctx, theme.fonts.sm)
   ImGui.PushStyleColor(ctx, ImGui.Col_Text, theme.col.text_label)
   ImGui.Text(ctx, "Generations")
@@ -632,7 +807,7 @@ local function draw_form()
   ImGui.SameLine(ctx, 0, 6)
   ImGui.Text(ctx, tostring(M.num_samples))
   ImGui.SameLine(ctx, 0, 6)
-  if card_button("+", 24) and M.num_samples < 4 then M.num_samples = M.num_samples + 1 end
+  if card_button("+", 24) and M.num_samples < max_samples then M.num_samples = M.num_samples + 1 end
   ImGui.PopFont(ctx)
   ImGui.Dummy(ctx, 0, theme.space.gap_sm)
 
@@ -849,10 +1024,6 @@ local function draw_toast()
   ImGui.PopFont(ctx)
 end
 
--- Extender: SFX_EXTEND_LIMITS v1.6.
-local EXT_MIN, EXT_MIN_LOOP, EXT_MAX, EXT_MAX_VIDEO, PREFIX_MIN, EXT_TOTAL_MAX =
-  1.0, 2.0, 57.0, 57.0, 3.0, 60.0
-
 local function draw_extender()
   banner("Seamlessly extend an audio clip with natural-sounding audio.", "info")
   ImGui.Dummy(ctx, 0, theme.space.gap_xs)
@@ -903,8 +1074,11 @@ local function draw_extender()
       EXT_TOTAL_MAX)
   end
   local loop_enabled = loop_reason == nil
-  local min_ext = eff_loop and EXT_MIN_LOOP or EXT_MIN
-  local ext_max = eff_video and math.min(EXT_MAX_VIDEO, cov.max_gap_free) or EXT_MAX
+  -- v3 publishes one append ceiling for extend, video-guided or not, so the
+  -- only thing the video leg narrows it by is how far the video actually runs.
+  local ext = M.limits.extend
+  local min_ext = eff_loop and ext.min_with_loop or ext.min
+  local ext_max = eff_video and math.min(ext.max, cov.max_gap_free) or ext.max
 
   -- "Extend by" stepper (0.1s grain).
   ImGui.PushFont(ctx, theme.fonts.sm)
@@ -948,14 +1122,14 @@ local function draw_extender()
   ImGui.Dummy(ctx, 0, theme.space.gap_xs)
 
   -- Validation (validateExtenderIntent).
-  local max_ext = eff_video and EXT_MAX_VIDEO or EXT_MAX
   local reason
   if foot < PREFIX_MIN then
     reason = string.format("Selected clip must be at least %.0f seconds (currently %.1fs).", PREFIX_MIN, foot)
   elseif M.extension < min_ext then
-    reason = string.format("Extension must be at least %.0fs%s.", min_ext, eff_loop and " when loop is enabled" or "")
-  elseif M.extension > max_ext then
-    reason = string.format("Extension cannot exceed %.0f seconds.", max_ext)
+    reason = string.format("Extension must be at least %ss%s.",
+      secs_text(min_ext), eff_loop and " when loop is enabled" or "")
+  elseif M.extension > ext.max then
+    reason = string.format("Extension cannot exceed %s seconds.", secs_text(ext.max))
   elseif eff_loop and (foot + M.extension) > EXT_TOTAL_MAX then
     reason = string.format("Total cannot exceed %.0fs when loop is enabled.", EXT_TOTAL_MAX)
   end
@@ -973,9 +1147,6 @@ local function draw_extender()
   credit_line(needed)
   draw_gen_error()
 end
-
--- Inpainter: SFX_INPAINT_LIMITS v1.6.
-local INP_GAP_MIN, INP_GAP_MAX, INP_START_MIN = 1.0, 8.0, 1.0
 
 local function draw_inpainter()
   banner("Replace part of a clip — select the clip and a time range inside it.", "info")
@@ -1018,13 +1189,15 @@ local function draw_inpainter()
   elseif re > clip_end then
     reason = "The range must end inside the selected clip."
   else
+    local inp = M.limits.inpaint
     local source_offset = clip.take_startoffs + (rs - clip_start) * rate
-    if source_offset < INP_START_MIN then
-      reason = string.format("Range must start at least %.0fs into the source audio.", INP_START_MIN)
-    elseif source_gap < INP_GAP_MIN then
-      reason = string.format("Selection must be at least %.0fs long.", INP_GAP_MIN)
-    elseif source_gap > INP_GAP_MAX then
-      reason = string.format("Selection cannot exceed %.0fs.", INP_GAP_MAX)
+    if source_offset < inp.start_min then
+      reason = string.format("Range must start at least %ss into the source audio.",
+        secs_text(inp.start_min))
+    elseif source_gap < inp.gap_min then
+      reason = string.format("Selection must be at least %ss long.", secs_text(inp.gap_min))
+    elseif source_gap > inp.gap_max then
+      reason = string.format("Selection cannot exceed %ss.", secs_text(inp.gap_max))
     end
   end
   if reason then banner(reason, "warn") end
@@ -1052,9 +1225,13 @@ local function logout()
   M.wave = {}; M.play_idx = nil
   -- net.reset() dropped any in-flight requests, so their callbacks won't run.
   -- Reset the flags those callbacks would have cleared, or the next session gets
-  -- stuck: fetch_me would early-return forever (blank credits) and the feedback
-  -- modal would stay on "Sending…".
+  -- stuck: fetch_me would early-return forever (blank credits), the registry
+  -- fetch would sit on "loading" with nothing left to answer it, and the
+  -- feedback modal would stay on "Sending…".
   M.me_inflight = false
+  M.limits = nil
+  M.models_status = "idle"; M.models_inflight = false
+  M.models_epoch = M.models_epoch + 1
   M.feedback_status = "idle"; M.feedback_error = ""
 end
 
@@ -1149,6 +1326,26 @@ local function draw_version_blocked()
   end
 end
 
+-- Stands in for the whole generation form until `GET /v3/models` answers.
+--
+-- Every bound the form draws comes from there, and there is deliberately no
+-- fallback to compiled numbers: rendering sliders against a guessed bound
+-- refuses requests the API would accept and only says so at generate time,
+-- which is worse than saying it here.
+local function draw_models_gate()
+  if M.models_status == "error" then
+    banner("The Mirelo API is unavailable, so the generation options couldn't be loaded. "
+      .. "Check your connection, then retry.", "warn")
+    ImGui.Dummy(ctx, 0, theme.space.gap_sm)
+    if primary_button("Retry", true) then fetch_models() end
+    return
+  end
+  ImGui.Dummy(ctx, 0, 24)
+  loading_dots()
+  ImGui.Dummy(ctx, 0, 10)
+  centered_note("Loading generation options…")
+end
+
 local function draw_main()
   -- "Update available" notice (dismissible).
   if M.version_notice then
@@ -1174,7 +1371,11 @@ local function draw_main()
   }, M.mode)
   ImGui.PopFont(ctx)
   ImGui.Dummy(ctx, 0, theme.space.gap_sm)
-  if M.mode == "extend" then
+  -- Music is the one tool whose bounds are compiled in (no v3 music family), so
+  -- it stays usable while the registry is still loading or has given up.
+  if M.mode ~= "music" and M.models_status ~= "ready" then
+    draw_models_gate()
+  elseif M.mode == "extend" then
     draw_extender()
   elseif M.mode == "inpaint" then
     draw_inpainter()
@@ -1186,6 +1387,19 @@ local function draw_main()
 end
 
 -- ---- public ---------------------------------------------------------------
+
+-- The registry fetch's own tick and state.
+--
+-- ui.draw drives `update` once per frame and the gate reads `status`; this
+-- handle exists so the loading / retry / deadline machine can also be driven
+-- and read without an ImGui frame, which is what makes the failure half —
+-- the half that never fires in normal use — reachable from the unit suite.
+ui.registry = {
+  fetch = function() fetch_models() end,
+  update = function() update_models() end,
+  status = function() return M.models_status end,
+  limits = function() return M.limits end,
+}
 
 function ui.init(imgui_mod, context, logo_img, icons)
   ImGui, ctx, logo = imgui_mod, context, logo_img
@@ -1202,6 +1416,7 @@ function ui.init(imgui_mod, context, logo_img, icons)
   if store.api_key() then
     M.route = "main"
     fetch_me()
+    fetch_models()
   else
     M.route = "auth"
   end
@@ -1227,6 +1442,7 @@ function ui.draw()
   M._was_busy = busy
 
   update_auth()
+  update_models()
   if reaper.time_precise() >= M.version_next_check then
     M.version_next_check = reaper.time_precise() + VERSION_RECHECK
     check_version()

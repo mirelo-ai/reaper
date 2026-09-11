@@ -1,5 +1,5 @@
 -- @description Mirelo — AI sound effects & music for REAPER
--- @version 1.1.0
+-- @version 1.2.0
 -- @author Mirelo
 -- @link Website https://mirelo.ai
 -- @provides
@@ -19,11 +19,9 @@
 --
 --   Run the "Mirelo" action to open the dockable window, then connect your account.
 -- @changelog
---   - A generation where only some samples come back now gives you the ones that worked, and says how many did not arrive. Before, one bad sample failed the whole batch.
---   - Refusals name the setting that was wrong, and say when you already have several generations running rather than blaming your credits.
---   - The credit line shows what you can spend right now, which is lower than your balance while your own generations are still running.
---   - A download whose link expired is retried on a fresh one instead of losing the sample.
---   - Sound effects, video-to-sfx, the extender and the inpainter now run on Mirelo's v3 API. Music is unchanged.
+--   - The duration, extension and inpaint limits now come from Mirelo when you sign in, instead of being built into the plugin. A limit that moves on our side reaches you without an update.
+--   - While those limits are loading the generation form waits, and if Mirelo cannot be reached it says so and offers a retry. It no longer shows controls whose limits it had to guess and then refuses the generation.
+--   - Music is unaffected by either and stays usable throughout.
 
 -- Mirelo for REAPER — pure ReaScript + ReaImGui edition.
 -- Single-script companion: no Electron, no bridge process, no installer.

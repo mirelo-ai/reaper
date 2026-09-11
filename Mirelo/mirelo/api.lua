@@ -1,9 +1,10 @@
 -- Mirelo HTTP API. Every call is async: pass a callback cb(err, data, status).
 -- err is a string or nil.
 --
--- Generation, assets and the account run on v3. Music stays on v2 because there
--- is no music family in v3, and so does /v2/plugin/feedback, which has no v3
--- equivalent — so this module deliberately talks to both versions.
+-- Generation, assets, the account and the model registry run on v3. Music stays
+-- on v2 because there is no music family in v3, and so does
+-- /v2/plugin/feedback, which has no v3 equivalent — so this module deliberately
+-- talks to both versions.
 
 local net = require("mirelo.net")
 local json = require("mirelo.json")
@@ -13,7 +14,7 @@ local errors = require("mirelo.errors")
 local api = {}
 
 api.PLUGIN_TYPE = "reaper"
-api.PLUGIN_VERSION = "1.1.0-reascript"
+api.PLUGIN_VERSION = "1.2.0-reascript"
 api.X_CLIENT = "REAPER Plugin v" .. api.PLUGIN_VERSION
 
 -- Set by the UI: invoked when any call fails with an auth error so the app can
@@ -177,6 +178,150 @@ function api.me(cb)
     label = "me",
     on_done = json_cb(cb),
   })
+end
+
+-- ---- Model registry -----------------------------------------------------
+
+-- Transport shape for the one call that gates the generation form.
+--
+-- `ME_CALL_TUNING` in the Adobe plugin is the precedent for the shape — a
+-- couple of retries behind a short backoff on an idempotent GET — but its cap
+-- is per attempt. Reusing that number here would multiply it by `attempts` and
+-- leave the user watching a spinner for that long, so `budget` is the whole
+-- run instead, and `timeout` is what one attempt gets once the backoffs come
+-- out of it.
+--
+-- The budget itself is enforced by the UI as a deadline checked on its tick.
+-- Lua has no promise to hang a timeout on, and net.request is a detached curl
+-- whose completion marker that tick polls.
+-- `min_attempt` is the shortest attempt worth starting. Below it the budget is
+-- effectively spent: nothing completes a round trip in that, and starting one
+-- anyway leaves a detached curl running past the deadline for an answer that
+-- is already refused.
+api.MODELS_TUNING = { attempts = 3, backoff = 0.5, budget = 15.0, min_attempt = 0.25 }
+api.MODELS_TUNING.timeout =
+  (api.MODELS_TUNING.budget - (api.MODELS_TUNING.attempts - 1) * api.MODELS_TUNING.backoff)
+  / api.MODELS_TUNING.attempts
+
+-- Whether a failed registry read is worth another of the budget's attempts.
+--
+-- Only "wait and it may work" failures are: a 4xx is the request rather than
+-- the transport (and an auth failure has already dropped the app to the connect
+-- screen), so retrying one spends the budget to be told the same thing.
+--
+-- A rate limit is the one 4xx that looks worth retrying and is not. The
+-- backoff between attempts is far shorter than the window any limiter is
+-- measuring over, so the retries answer 429 too and add load to a service
+-- already saying it has too much. The error state's Retry is the right pace
+-- for that one, and this is a single read at sign-in, so nothing but a limiter
+-- that is already unhappy can reach it.
+function api.models_retryable(category)
+  return category == "network" or category == "server"
+end
+
+-- cb(err, data, status, category) where data = { data = { <model>, … } }. Feed
+-- the body to api.model_limits to read the bounds out of it.
+--
+-- `timeout` overrides this attempt's cap, which a caller near the end of its
+-- budget wants: a full slot there would leave curl waiting on an answer the
+-- deadline has already refused.
+function api.models(cb, timeout)
+  net.request({
+    method = "GET",
+    url = base() .. "/v3/models",
+    headers = headers(true),
+    timeout = timeout or api.MODELS_TUNING.timeout,
+    label = "models",
+    on_done = json_cb(cb),
+  })
+end
+
+-- A real table, so a JSON null (a truthy sentinel) can't pass for one.
+local function tbl(value)
+  if type(value) ~= "table" or value == json.null then return nil end
+  return value
+end
+
+-- A published bound in milliseconds, as seconds. nil unless it really is a
+-- number: every caller here treats a missing bound as an unusable registry.
+local function secs(ms)
+  if type(ms) ~= "number" then return nil end
+  return ms / 1000
+end
+
+local function variants_max(operation)
+  local n = tbl(operation.num_variants)
+  if not n or type(n.max) ~= "number" then return nil end
+  return n.max
+end
+
+-- The bounds one model publishes, in the shape the form works in, or nil if the
+-- body doesn't carry them.
+--
+-- Seconds, because every consumer is a timeline duration and the registry is in
+-- milliseconds. Duration and sample bounds are keyed by the plugin's own
+-- endpoint kinds so a call site can index them with the name it already routes
+-- on.
+--
+-- All-or-nothing: a half-answered registry has to fail exactly the way an
+-- unreachable one does, or the form renders with one bound quietly missing —
+-- which is the guessing this call exists to remove. The single exception is
+-- `min_with_loop`, because v3 uses an absent key to say a model has no such
+-- variant (that is how the absence of `prepend_duration_ms` says extend only
+-- appends), so an absent loop floor means loop shares the base floor.
+function api.model_limits(body, model_id)
+  local list = tbl(body) and tbl(body.data)
+  if not list then return nil end
+  local model
+  for _, entry in ipairs(list) do
+    if tbl(entry) and entry.id == model_id then
+      model = entry
+      break
+    end
+  end
+  local ops = tbl(model) and tbl(model.operations)
+  if not ops then return nil end
+
+  local text = tbl(ops["text-to-sfx"])
+  local video = tbl(ops["video-to-sfx"])
+  local extend = tbl(ops.extend)
+  local inpaint = tbl(ops.inpaint)
+  if not (text and video and extend and inpaint) then return nil end
+
+  local text_ms = tbl(text.duration_ms)
+  local video_ms = tbl(video.duration_ms)
+  local append_ms = tbl(extend.append_duration_ms)
+  local start_ms = tbl(inpaint.region_start_ms)
+  local width_ms = tbl(inpaint.region_width_ms)
+  if not (text_ms and video_ms and append_ms and start_ms and width_ms) then return nil end
+
+  local sfx_min, sfx_max = secs(text_ms.min), secs(text_ms.max)
+  local video_min, video_max = secs(video_ms.min), secs(video_ms.max)
+  local ext_min, ext_max = secs(append_ms.min), secs(append_ms.max)
+  local gap_start, gap_min, gap_max = secs(start_ms.min), secs(width_ms.min), secs(width_ms.max)
+  local sfx_variants, video_variants = variants_max(text), variants_max(video)
+  if not (sfx_min and sfx_max and video_min and video_max and ext_min and ext_max
+    and gap_start and gap_min and gap_max and sfx_variants and video_variants) then
+    return nil
+  end
+
+  return {
+    duration = {
+      sfx = { min = sfx_min, max = sfx_max },
+      video_sfx = { min = video_min, max = video_max },
+    },
+    samples = {
+      sfx = sfx_variants,
+      video_sfx = video_variants,
+    },
+    -- v3 publishes one append ceiling; the video-guided leg shares it.
+    extend = {
+      min = ext_min,
+      max = ext_max,
+      min_with_loop = secs(append_ms.min_with_loop) or ext_min,
+    },
+    inpaint = { start_min = gap_start, gap_min = gap_min, gap_max = gap_max },
+  }
 end
 
 -- ---- Version gate + feedback --------------------------------------------
