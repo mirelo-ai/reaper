@@ -31,4 +31,8 @@ function store.api_base()
   return store.get("api_base", "https://api.mirelo.ai")
 end
 
+function store.studio_base()
+  return (store.get("studio_base", "https://mirelo.ai/studio"):gsub("/+$", ""))
+end
+
 return store

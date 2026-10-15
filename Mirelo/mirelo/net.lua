@@ -7,10 +7,12 @@
 --   2. Launch `curl -K cfg` with reaper.ExecProcess(cmd, -1) -> detached, returns
 --      immediately, never blocks the frame.
 --   3. Tell curl to write its own completion marker:
---         --write-out "%output{<done>}%{http_code}"
---      curl writes the HTTP status to <done> only after the transfer finishes
---      (success OR HTTP error OR connection failure -> "000"), so the marker
---      strictly follows the fully-written body/download file.
+--         --write-out "%output{<done>}%{http_code} %{exitcode}"
+--      curl writes the HTTP status and its exit code to <done> only after the
+--      transfer ends (success OR HTTP error OR connection failure -> "000"), so
+--      the marker strictly follows the body/download file. The exit code is
+--      what says the file is whole: a transfer aborted after a 200 (a stall,
+--      the time limit) still reports 200.
 --   4. net.update(), called once per ImGui frame, polls the marker files and
 --      fires each request's on_done callback.
 --
@@ -125,6 +127,9 @@ end
 --   form_file   path sent as the last part, named "file"
 --   download_to path to write the response body to (binary download)
 --   timeout     seconds (default 60)
+--   stall       { bytes_per_second, seconds }: also fail a transfer that runs
+--               slower than that for that long, so `timeout` can be a generous
+--               ceiling for a large file without leaving a dead one hanging
 --   label       string for diagnostics
 --   on_done     function(res) where res = {ok, status, body, error, label}
 -- Returns a handle (also pushed onto the pending list).
@@ -192,12 +197,16 @@ function net.request(opts)
   end
 
   add('output = "' .. fwd(body_path) .. '"')
-  add('write-out = "%output{' .. fwd(done_path) .. '}%{http_code}"')
+  add('write-out = "%output{' .. fwd(done_path) .. '}%{http_code} %{exitcode}"')
   add("silent")
   add("show-error")
   add("location")              -- follow 3xx (S3 redirects)
   add("max-redirs = 5")
   add("max-time = " .. tostring(opts.timeout or 60))
+  if opts.stall then
+    add("speed-limit = " .. tostring(opts.stall[1]))
+    add("speed-time = " .. tostring(opts.stall[2]))
+  end
 
   if not write_file(cfg_path, table.concat(lines, "\n") .. "\n") then
     rm(req_body_path)
@@ -264,12 +273,21 @@ function net.update()
     if state.pending ~= batch then return end
     local marker = read_file(h.done, false)
     if marker and marker:match("^%d%d%d") then
-      local status = tonumber(marker:match("^(%d%d%d)"))
+      local code, exit_code = marker:match("^(%d%d%d)%s*(%d*)")
+      local status = tonumber(code)
+      -- A curl that can't report an exit code leaves the field empty; the status
+      -- is all it said, as before.
+      local exit = tonumber(exit_code) or 0
       local body = nil
       if not h.is_download then body = read_file(h.body, true) end
       local ok = status >= 200 and status < 300
       local err = nil
-      if not ok then
+      if exit ~= 0 and ok then
+        -- The server answered, but the transfer was cut off before the end, so
+        -- the body or file is partial. Reported like a dropped connection.
+        ok, status = false, 0
+        err = "the transfer stopped before it finished (curl exit " .. exit .. ")"
+      elseif not ok then
         err = status == 0 and "no response from server (check your connection)"
           or ("HTTP " .. tostring(status))
       end

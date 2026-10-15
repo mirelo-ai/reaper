@@ -10,34 +10,45 @@ local net = require("mirelo.net")
 local json = require("mirelo.json")
 local store = require("mirelo.store")
 local errors = require("mirelo.errors")
+local credits = require("mirelo.credits")
 
 local api = {}
 
 api.PLUGIN_TYPE = "reaper"
-api.PLUGIN_VERSION = "1.2.0-reascript"
+api.PLUGIN_VERSION = "1.3.0-reascript"
 api.X_CLIENT = "REAPER Plugin v" .. api.PLUGIN_VERSION
 
 -- Set by the UI: invoked when any call fails with an auth error so the app can
 -- drop back to the connect screen (centralised re-auth).
 api.on_auth_error = nil
 
--- The v3 model every collection runs. 2.0 arrives as another model id rather
--- than as another API, so this is the only place the version is named.
-api.V3_MODEL = "sfx-1.6"
+-- The v3 models this plugin runs, and the only place either is named. Text- and
+-- video-to-SFX generate with GENERATE_MODEL. v3 serves extend and inpaint, and
+-- the loop control that rides on extend, only on EDIT_MODEL, so the edits stay
+-- there.
+api.GENERATE_MODEL = "sfx-2.0"
+api.EDIT_MODEL = "sfx-1.6"
 
--- Where each generation kind lives. The five that moved name their v3
--- collection path; the two music kinds keep the v2 endpoint/version pair.
+-- Where each generation kind lives. The five v3 kinds name their collection
+-- path and the model they send; the two music kinds keep the v2
+-- endpoint/version pair.
 api.MODELS = {
-  sfx          = { v3 = "/v3/text-to-sfx/generations" },
-  video_sfx    = { v3 = "/v3/video-to-sfx/generations" },
+  sfx          = { v3 = "/v3/text-to-sfx/generations",  model = api.GENERATE_MODEL },
+  video_sfx    = { v3 = "/v3/video-to-sfx/generations", model = api.GENERATE_MODEL },
   -- Both extends poll one collection: v3 folded the `with_video` route into the
   -- presence of `input.video`.
-  extend       = { v3 = "/v3/extend/edits" },
-  extend_video = { v3 = "/v3/extend/edits" },
-  inpaint      = { v3 = "/v3/inpaint/edits" },
+  extend       = { v3 = "/v3/extend/edits",  model = api.EDIT_MODEL },
+  extend_video = { v3 = "/v3/extend/edits",  model = api.EDIT_MODEL },
+  inpaint      = { v3 = "/v3/inpaint/edits", model = api.EDIT_MODEL },
   music        = { v2 = "text-to-music",  version = "v1.0" },
   video_music  = { v2 = "video-to-music", version = "v1.0" },
 }
+
+-- Video-to-SFX sends speech handling explicitly rather than inheriting the
+-- model's default, which GENERATE_MODEL publishes as keeping it. The generated
+-- clip lands beside the clip's own audio, so keeping the dialogue would play it
+-- twice.
+api.VIDEO_CONTROLS = { preserve_speech = false }
 
 local function base() return store.api_base() end
 
@@ -94,7 +105,7 @@ end
 
 -- Decode JSON and route failures through the shared error classifier so every
 -- call site gets the same friendly, actionable copy as the other plugins.
--- Calls cb(err_message_or_nil, data, status, category). Auth errors also fire
+-- Calls cb(err_message_or_nil, data, status, category, credit_recovery). Auth errors also fire
 -- api.on_auth_error so the app drops to the connect screen.
 local function classify_and_call(cb, res, data)
   local err = data and type(data) == "table" and data.error or nil
@@ -110,7 +121,8 @@ local function classify_and_call(cb, res, data)
   -- is guarded by gen.is_busy(), so a stale job's callback can't resurrect an
   -- error banner after the reset.
   if v.category == "auth" and api.on_auth_error then api.on_auth_error() end
-  return cb(v.message, data, res.status, v.category)
+  return cb(v.message, data, res.status, v.category,
+    credits.recovery_from_error(data, store.studio_base()))
 end
 
 local function json_cb(cb)
@@ -160,7 +172,7 @@ end
 
 -- The web approval page the user opens to bless the nonce.
 function api.connect_url(nonce)
-  return "https://mirelo.ai/studio/connect-plugin?nonce=" .. net.urlencode(nonce)
+  return store.studio_base() .. "/connect-plugin?nonce=" .. net.urlencode(nonce)
 end
 
 -- ---- Account ------------------------------------------------------------
@@ -255,53 +267,40 @@ local function variants_max(operation)
   return n.max
 end
 
--- The bounds one model publishes, in the shape the form works in, or nil if the
--- body doesn't carry them.
---
--- Seconds, because every consumer is a timeline duration and the registry is in
--- milliseconds. Duration and sample bounds are keyed by the plugin's own
--- endpoint kinds so a call site can index them with the name it already routes
--- on.
---
--- All-or-nothing: a half-answered registry has to fail exactly the way an
--- unreachable one does, or the form renders with one bound quietly missing —
--- which is the guessing this call exists to remove. The single exception is
--- `min_with_loop`, because v3 uses an absent key to say a model has no such
--- variant (that is how the absence of `prepend_duration_ms` says extend only
--- appends), so an absent loop floor means loop shares the base floor.
-function api.model_limits(body, model_id)
-  local list = tbl(body) and tbl(body.data)
-  if not list then return nil end
-  local model
-  for _, entry in ipairs(list) do
-    if tbl(entry) and entry.id == model_id then
-      model = entry
-      break
-    end
-  end
-  local ops = tbl(model) and tbl(model.operations)
-  if not ops then return nil end
+-- A published per-second credit rate, or nil unless it is a positive number.
+local function rate_of(model)
+  local rate = model.credits_per_second
+  if type(rate) ~= "number" or rate <= 0 then return nil end
+  return rate
+end
 
-  local text = tbl(ops["text-to-sfx"])
-  local video = tbl(ops["video-to-sfx"])
-  local extend = tbl(ops.extend)
-  local inpaint = tbl(ops.inpaint)
-  if not (text and video and extend and inpaint) then return nil end
+-- The registry entry for one model id, or nil if the list doesn't carry it.
+local function find_model(list, model_id)
+  for _, entry in ipairs(list) do
+    if tbl(entry) and entry.id == model_id then return entry end
+  end
+  return nil
+end
+
+-- What GENERATE_MODEL publishes for text- and video-to-SFX, or nil if any of it
+-- is missing.
+local function generate_limits(model)
+  local ops = tbl(model.operations)
+  local text = ops and tbl(ops["text-to-sfx"])
+  local video = ops and tbl(ops["video-to-sfx"])
+  if not (text and video) then return nil end
 
   local text_ms = tbl(text.duration_ms)
   local video_ms = tbl(video.duration_ms)
-  local append_ms = tbl(extend.append_duration_ms)
-  local start_ms = tbl(inpaint.region_start_ms)
-  local width_ms = tbl(inpaint.region_width_ms)
-  if not (text_ms and video_ms and append_ms and start_ms and width_ms) then return nil end
+  if not (text_ms and video_ms) then return nil end
 
   local sfx_min, sfx_max = secs(text_ms.min), secs(text_ms.max)
   local video_min, video_max = secs(video_ms.min), secs(video_ms.max)
-  local ext_min, ext_max = secs(append_ms.min), secs(append_ms.max)
-  local gap_start, gap_min, gap_max = secs(start_ms.min), secs(width_ms.min), secs(width_ms.max)
   local sfx_variants, video_variants = variants_max(text), variants_max(video)
-  if not (sfx_min and sfx_max and video_min and video_max and ext_min and ext_max
-    and gap_start and gap_min and gap_max and sfx_variants and video_variants) then
+  local prompt_max = model.max_prompt_chars
+  local rate = rate_of(model)
+  if not (sfx_min and sfx_max and video_min and video_max and sfx_variants and video_variants
+    and type(prompt_max) == "number" and rate) then
     return nil
   end
 
@@ -310,10 +309,35 @@ function api.model_limits(body, model_id)
       sfx = { min = sfx_min, max = sfx_max },
       video_sfx = { min = video_min, max = video_max },
     },
-    samples = {
-      sfx = sfx_variants,
-      video_sfx = video_variants,
-    },
+    samples = { sfx = sfx_variants, video_sfx = video_variants },
+    -- Characters. Only the text prompt has a box: video-to-SFX sends none.
+    prompt_max = prompt_max,
+    rate = rate,
+  }
+end
+
+-- What EDIT_MODEL publishes for extend and inpaint, or nil if any of it is
+-- missing. The one bound allowed to be absent is `min_with_loop`, because v3
+-- uses an absent key to say a model has no such variant (that is how the
+-- absence of `prepend_duration_ms` says extend only appends), so an absent loop
+-- floor means loop shares the base floor.
+local function edit_limits(model)
+  local ops = tbl(model.operations)
+  local extend = ops and tbl(ops.extend)
+  local inpaint = ops and tbl(ops.inpaint)
+  if not (extend and inpaint) then return nil end
+
+  local append_ms = tbl(extend.append_duration_ms)
+  local start_ms = tbl(inpaint.region_start_ms)
+  local width_ms = tbl(inpaint.region_width_ms)
+  if not (append_ms and start_ms and width_ms) then return nil end
+
+  local ext_min, ext_max = secs(append_ms.min), secs(append_ms.max)
+  local gap_start, gap_min, gap_max = secs(start_ms.min), secs(width_ms.min), secs(width_ms.max)
+  local rate = rate_of(model)
+  if not (ext_min and ext_max and gap_start and gap_min and gap_max and rate) then return nil end
+
+  return {
     -- v3 publishes one append ceiling; the video-guided leg shares it.
     extend = {
       min = ext_min,
@@ -321,7 +345,49 @@ function api.model_limits(body, model_id)
       min_with_loop = secs(append_ms.min_with_loop) or ext_min,
     },
     inpaint = { start_min = gap_start, gap_min = gap_min, gap_max = gap_max },
+    rate = rate,
   }
+end
+
+-- The bounds the form works in, read off the model each kind sends, or nil if
+-- the body doesn't carry them.
+--
+-- Seconds, because every consumer is a timeline duration and the registry is in
+-- milliseconds. Duration, sample and rate bounds are keyed by the plugin's own
+-- endpoint kinds so a call site can index them with the name it already routes
+-- on.
+--
+-- All-or-nothing per model: a half-answered entry has to fail exactly the way
+-- an unreachable registry does, or the form renders with one bound quietly
+-- missing, which is the guessing this call exists to remove.
+--
+-- GENERATE_MODEL being absent is the one gap that is not a broken registry. v3
+-- leaves a gated model out of the list for an account that can't use it, so
+-- `generate` is nil and the edits still load. An entry that is listed but half
+-- answered is still a broken registry.
+function api.model_limits(body)
+  local list = tbl(body) and tbl(body.data)
+  if not list then return nil end
+
+  local edit_model = find_model(list, api.EDIT_MODEL)
+  local edits = edit_model and edit_limits(edit_model)
+  if not edits then return nil end
+
+  local generate_model = find_model(list, api.GENERATE_MODEL)
+  local generate = nil
+  if generate_model then
+    generate = generate_limits(generate_model)
+    if not generate then return nil end
+  end
+
+  -- Each kind's local quote prices at the rate of the model it sends.
+  local rates = { [api.EDIT_MODEL] = edits.rate, [api.GENERATE_MODEL] = generate and generate.rate }
+  local rate = {}
+  for kind, route in pairs(api.MODELS) do
+    if route.model then rate[kind] = rates[route.model] end
+  end
+
+  return { generate = generate, extend = edits.extend, inpaint = edits.inpaint, rate = rate }
 end
 
 -- ---- Version gate + feedback --------------------------------------------
@@ -358,6 +424,61 @@ function api.submit_feedback(message, cb)
 end
 
 -- ---- Generation ---------------------------------------------------------
+
+-- Quote one concrete request so its recovery action is sized to that request,
+-- not to /v3/me's smallest billable request.
+function api.preflight(kind, duration_ms, num_samples, loop, cb)
+  local route = api.MODELS[kind]
+  if route.v2 then
+    local query = "?duration_ms=" .. net.urlencode(tostring(duration_ms))
+      .. "&num_samples=" .. net.urlencode(tostring(num_samples or 1))
+    return net.request({
+      method = "GET",
+      url = base() .. "/v2/" .. route.v2 .. "/" .. route.version .. "/preflight" .. query,
+      headers = headers(true),
+      timeout = 30,
+      label = kind .. "-preflight",
+      on_done = json_cb(cb),
+    })
+  end
+
+  local placeholder = "https://placeholder.invalid/audio.wav"
+  local body
+  if kind == "sfx" then
+    body = {
+      model = route.model, duration_ms = duration_ms, num_variants = num_samples or 1,
+      input = { prompt = "preflight" },
+    }
+  elseif kind == "video_sfx" then
+    body = {
+      model = route.model, duration_ms = duration_ms, num_variants = num_samples or 1,
+      input = { video = { type = "url", url = "https://placeholder.invalid/video.mp4" } },
+      controls = api.VIDEO_CONTROLS,
+    }
+  elseif kind == "inpaint" then
+    body = {
+      model = route.model,
+      region = { start_ms = 1000, end_ms = 1000 + duration_ms },
+      num_variants = num_samples or 1,
+      input = { audio = { type = "url", url = placeholder } },
+    }
+  else
+    body = {
+      model = route.model, append_duration_ms = duration_ms, num_variants = num_samples or 1,
+      input = { audio = { type = "url", url = placeholder } },
+    }
+    if loop then body.controls = { loop = true } end
+  end
+  return net.request({
+    method = "POST",
+    url = base() .. route.v3 .. "/preflight",
+    headers = json_headers(true),
+    body = json.encode(body),
+    timeout = 30,
+    label = kind .. "-preflight",
+    on_done = json_cb(cb),
+  })
+end
 
 -- POST a v3 create. cb(err, data) where data carries the job `id`.
 local function create_v3(kind, body, cb)
@@ -399,7 +520,7 @@ function api.submit_job(kind, params, cb)
     }, cb)
   end
   return create_v3(kind, {
-    model = api.V3_MODEL,
+    model = api.MODELS[kind].model,
     duration_ms = params.duration_ms,
     num_variants = params.num_samples or 1,
     input = { prompt = params.prompt },
@@ -407,6 +528,15 @@ function api.submit_job(kind, params, cb)
 end
 
 -- ---- Asset upload (video- and audio-conditioned generation) -------------
+
+-- How long a file transfer, up or down, may take. A long range is a large file
+-- (a ten-minute video renders to well over a hundred megabytes, and so do four
+-- ten-minute results downloading at once), so a flat cap refuses it on any
+-- connection slower than the cap assumed. A transfer fails instead when it
+-- stalls, moving under `stall` bytes a second for that many seconds, and
+-- `ceiling` is only the outer bound: about the lifetime of an upload ticket,
+-- past which storage refuses the upload anyway.
+api.TRANSFER = { ceiling = 3600, stall = { 1024, 60 } }
 
 -- Step 1: mint an upload ticket. cb(err, data) where data =
 -- { id, upload_url, upload_expires_at, max_bytes, fields }. `fields` is what
@@ -457,7 +587,8 @@ function api.upload_asset(ticket, file_path, cb)
     headers = { "Expect:" },
     form = form,
     form_file = file_path,
-    timeout = 600,
+    timeout = api.TRANSFER.ceiling,
+    stall = api.TRANSFER.stall,
     label = "upload-asset",
     on_done = function(res)
       if not res.ok then return cb(upload_message(res.status)) end
@@ -478,10 +609,11 @@ function api.submit_video(kind, asset_id, params, cb)
     }, cb)
   end
   return create_v3(kind, {
-    model = api.V3_MODEL,
+    model = api.MODELS[kind].model,
     duration_ms = params.duration_ms,
     num_variants = params.num_samples or 1,
     input = { video = { type = "asset", id = asset_id } },
+    controls = api.VIDEO_CONTROLS,
   }, cb)
 end
 
@@ -491,7 +623,7 @@ end
 -- params = { append_duration_ms, num_samples, loop }
 function api.submit_extend(asset_id, params, cb)
   local body = {
-    model = api.V3_MODEL,
+    model = api.MODELS.extend.model,
     append_duration_ms = params.append_duration_ms,
     num_variants = params.num_samples or 1,
     input = { audio = { type = "asset", id = asset_id } },
@@ -505,7 +637,7 @@ end
 -- keeps its schema default of 0.
 function api.submit_extend_video(audio_asset_id, video_asset_id, params, cb)
   return create_v3("extend_video", {
-    model = api.V3_MODEL,
+    model = api.MODELS.extend_video.model,
     append_duration_ms = params.append_duration_ms,
     num_variants = params.num_samples or 1,
     input = {
@@ -518,7 +650,7 @@ end
 -- params = { segment_start_ms, segment_end_ms, num_samples }
 function api.submit_inpaint(asset_id, params, cb)
   return create_v3("inpaint", {
-    model = api.V3_MODEL,
+    model = api.MODELS.inpaint.model,
     region = { start_ms = params.segment_start_ms, end_ms = params.segment_end_ms },
     num_variants = params.num_samples or 1,
     input = { audio = { type = "asset", id = asset_id } },
@@ -664,7 +796,8 @@ function api.download(url, dest, cb)
     url = url,
     headers = {}, -- pre-signed; adding Authorization can break the signature
     download_to = dest,
-    timeout = 300,
+    timeout = api.TRANSFER.ceiling,
+    stall = api.TRANSFER.stall,
     label = "download",
     on_done = function(res)
       if not res.ok then return cb(errors.classify(res.status).message) end

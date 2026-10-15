@@ -8,6 +8,7 @@
 -- Placement (Add-to-track) is deferred to gen.place(item) per the placement ctx.
 
 local api = require("mirelo.api")
+local credits = require("mirelo.credits")
 local net = require("mirelo.net")
 local render = require("mirelo.render")
 local wav = require("mirelo.wav")
@@ -15,8 +16,12 @@ local R = require("mirelo.reaper_io")
 
 local POLL_INTERVAL = 2.0
 -- Give up polling a job that never reaches a terminal state, so a stuck backend
--- job can't leave the UI on "Generating…" forever.
+-- job can't leave the UI on "Generating…" forever. POLL_TIMEOUT_SEC is the least
+-- a job gets; one the server estimates as long gets POLL_ESTIMATE_FACTOR times
+-- its `estimated_ms` instead, so a long range is not abandoned while the server
+-- is still producing it, and charging for it.
 local POLL_TIMEOUT_SEC = 600
+local POLL_ESTIMATE_FACTOR = 3
 local TOTAL_MAX_SEC = 60 -- extend: prefix + new audio cap (SFX_EXTEND_LIMITS v1.6)
 
 local gen = {}
@@ -63,10 +68,12 @@ gen.state = {
   job_id = nil,
   results = {},
   error = nil,
+  credit_recovery = nil,
   captured_pos = 0,
   num_samples = 1,
   place_ctx = nil, -- { mode="cursor"|"inpaint", pos, clip_in?, clip_out? }
   _next_poll = 0,
+  _poll_started = 0,
   _poll_deadline = 0,
   _poll_inflight = false,
   _dl_total = 0,
@@ -82,11 +89,12 @@ local function reset(kind, is_music)
   local s = gen.state
   s.status = "idle"; s.kind = kind; s.is_music = is_music or false
   s.progress = 0; s.message = ""; s.job_id = nil; s.results = {}; s.error = nil
+  s.credit_recovery = nil
   s.place_ctx = nil
   s.active_clip = nil -- clip snapshot shown by the extender/inpainter while busy
   s._hl = nil; s._original = nil; s._pair = nil
   s.label = nil; s.place_name = nil; s._name_from_output = false
-  s._next_poll = 0; s._poll_deadline = 0; s._poll_inflight = false
+  s._next_poll = 0; s._poll_started = 0; s._poll_deadline = 0; s._poll_inflight = false
   s._dl_total = 0; s._dl_done = 0; s._dl_failed = 0; s._undelivered = 0
   s._render_file = nil; s._upload_file = nil
 end
@@ -127,13 +135,14 @@ cleanup_temps = function()
   if s._upload_file then os.remove(s._upload_file); s._upload_file = nil end
 end
 
-local function fail(msg)
+local function fail(msg, credit_recovery)
   -- A torn-down job (logout/reset set status to idle) must not resurrect an
   -- error banner when its late callback finally returns an error.
   if not gen.is_busy() then return end
   cleanup_temps()
   gen.state.status = "error"
   gen.state.error = msg
+  gen.state.credit_recovery = credit_recovery
   gen.state.message = msg
 end
 
@@ -296,6 +305,10 @@ local function handle_v3_poll(data)
     return fail(api.job_failure(data)
       or "the generation finished in a state this version doesn't understand — please update the plugin")
   end
+  -- A later poll can revise the estimate upwards; the budget follows it.
+  if type(data.estimated_ms) == "number" then
+    s._poll_deadline = math.max(s._poll_deadline, s._poll_started + gen.poll_budget(data.estimated_ms))
+  end
   if reaper.time_precise() > s._poll_deadline then
     return fail("generation timed out — please try again")
   end
@@ -335,20 +348,31 @@ local function handle_v2_poll(data)
   s._next_poll = reaper.time_precise() + POLL_INTERVAL
 end
 
-local function handle_poll(err, data)
+local function handle_poll(err, data, _status, _category, credit_recovery)
   local s = gen.state
   s._poll_inflight = false
   if s.status ~= "polling" then return end -- a reset (logout) dropped this job; ignore the stale response
-  if err then return fail(err) end
+  if err then return fail(err, credit_recovery) end
   if not data then return fail("empty poll response") end
   if is_v3_kind(s.kind) then return handle_v3_poll(data) end
   return handle_v2_poll(data)
 end
 
-local function begin_poll(job_id)
+-- Seconds a job may stay unfinished before polling gives up, given the job's
+-- own `estimated_ms` (nil when it published none).
+function gen.poll_budget(estimated_ms)
+  local est = tonumber(estimated_ms)
+  if not est or est <= 0 then return POLL_TIMEOUT_SEC end
+  return math.max(POLL_TIMEOUT_SEC, POLL_ESTIMATE_FACTOR * est / 1000)
+end
+
+-- `created` is the create response, whose `estimated_ms` sets the first budget.
+local function begin_poll(job_id, created)
   local s = gen.state
   if not s.kind then return end -- state was reset (logout) mid-flight; never poll a nil model
-  s._poll_deadline = reaper.time_precise() + POLL_TIMEOUT_SEC
+  s._poll_started = reaper.time_precise()
+  local estimate = type(created) == "table" and created.estimated_ms or nil
+  s._poll_deadline = s._poll_started + gen.poll_budget(estimate)
   s.job_id = job_id
   s.status = "polling"
   s.progress = math.max(s.progress, 2)
@@ -369,12 +393,12 @@ function gen.start_text(kind, params, captured_pos)
   s.label = truncate(params.prompt, 40)
   if s.label == "" then s.label = s.place_name end
   s.place_ctx = { mode = "cursor", pos = s.captured_pos }
-  api.submit_job(kind, params, function(err, data)
+  api.submit_job(kind, params, function(err, data, _status, _category, credit_recovery)
     if epoch ~= job then return end
-    if err then return fail(err) end
+    if err then return fail(err, credit_recovery) end
     local job_id = job_id_of(data)
     if not job_id then return fail("no job id returned") end
-    begin_poll(job_id)
+    begin_poll(job_id, data)
   end)
 end
 
@@ -405,14 +429,14 @@ function gen.start_video(kind, params, captured_pos, range)
         if uerr then return fail("video upload failed: " .. uerr) end
         cleanup_temps()
         s.status = "submitting"; s.message = "Submitting…"; s.progress = 45
-        local dms = params.duration_ms or math.floor((duration or range.len or 0) * 1000)
+        local dms = params.duration_ms or credits.request_ms(duration or range.len or 0)
         api.submit_video(kind, ticket.id, { duration_ms = dms, num_samples = s.num_samples },
-          function(serr, sdata)
+          function(serr, sdata, _status, _category, credit_recovery)
             if epoch ~= job then return end
-            if serr then return fail(serr) end
+            if serr then return fail(serr, credit_recovery) end
             local job_id = job_id_of(sdata)
             if not job_id then return fail("no job id returned") end
-            begin_poll(job_id)
+            begin_poll(job_id, sdata)
           end)
       end)
     end)
@@ -463,13 +487,13 @@ local function start_extend_video(s, opts, clip, audio_file, prefix_dur, auto_tr
             cleanup_temps()
             s.status = "submitting"; s.message = "Submitting…"; s.progress = 55
             api.submit_extend_video(audio_ticket.id, video_ticket.id, {
-              append_duration_ms = math.floor(opts.extension_seconds * 1000), num_samples = 1,
-            }, function(se, sdata)
+              append_duration_ms = credits.request_ms(opts.extension_seconds), num_samples = 1,
+            }, function(se, sdata, _status, _category, credit_recovery)
               if epoch ~= job then return end
-              if se then return fail(se) end
+              if se then return fail(se, credit_recovery) end
               local job_id = job_id_of(sdata)
               if not job_id then return fail("no job id returned") end
-              begin_poll(job_id)
+              begin_poll(job_id, sdata)
             end)
           end)
         end)
@@ -538,14 +562,14 @@ function gen.start_extend(opts, clip)
       if uerr then return fail("upload failed: " .. uerr) end
       s.status = "submitting"; s.message = "Submitting…"; s.progress = 45
       api.submit_extend(ticket.id, {
-        append_duration_ms = math.floor(opts.extension_seconds * 1000),
+        append_duration_ms = credits.request_ms(opts.extension_seconds),
         num_samples = 1, loop = opts.loop,
-      }, function(serr, sdata)
+      }, function(serr, sdata, _status, _category, credit_recovery)
         if epoch ~= job then return end
-        if serr then return fail(serr) end
+        if serr then return fail(serr, credit_recovery) end
         local job_id = job_id_of(sdata)
         if not job_id then return fail("no job id returned") end
-        begin_poll(job_id)
+        begin_poll(job_id, sdata)
       end)
     end)
   end)
@@ -565,13 +589,9 @@ function gen.start_inpaint(clip)
   s._pair = next_batch -- groups Original + Inpainted into one section
 
   local rate = (clip.take_playrate and clip.take_playrate ~= 0) and clip.take_playrate or 1
-  -- Source-relative gap (resolveInpaintSourceRegion): in-point + the timeline
-  -- delta scaled by the take playrate (consistent with start_extend's
-  -- item_len * rate; rate == 1 leaves the common case unchanged).
-  local seg_start = clip.take_startoffs + (clip.ts_start - clip.item_pos) * rate
-  local seg_end = seg_start + (clip.ts_end - clip.ts_start) * rate
-  local seg_start_ms = math.max(0, math.floor(seg_start * 1000 + 0.5))
-  local seg_end_ms = math.max(0, math.floor(seg_end * 1000 + 0.5))
+  -- The inpaint quote prices this same region, so both read it from credits.
+  local seg_start, seg_end = credits.inpaint_segment(clip)
+  local seg_start_ms, seg_end_ms = credits.region_ms(seg_start, seg_end)
 
   local clip_in = clip.take_startoffs
   local clip_out = clip_in + clip.item_len * rate
@@ -596,12 +616,12 @@ function gen.start_inpaint(clip)
       s.status = "submitting"; s.message = "Submitting…"; s.progress = 45
       api.submit_inpaint(ticket.id, {
         segment_start_ms = seg_start_ms, segment_end_ms = seg_end_ms, num_samples = 1,
-      }, function(serr, sdata)
+      }, function(serr, sdata, _status, _category, credit_recovery)
         if epoch ~= job then return end
-        if serr then return fail(serr) end
+        if serr then return fail(serr, credit_recovery) end
         local job_id = job_id_of(sdata)
         if not job_id then return fail("no job id returned") end
-        begin_poll(job_id)
+        begin_poll(job_id, sdata)
       end)
     end)
   end)

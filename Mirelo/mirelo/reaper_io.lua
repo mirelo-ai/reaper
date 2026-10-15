@@ -143,9 +143,13 @@ end
 function R.open_url(url)
   -- The version-check response's updateUrl is server-supplied and ends up here,
   -- and on macOS/Linux the fallbacks embed it in an os.execute shell string.
-  -- Only ever launch a well-formed https URL whose characters can't break out
-  -- of (or inject into) that string — reject anything else outright.
-  if type(url) ~= "string" or not url:match("^https://[%w%-%._~/%?#%[%]@:=&%%]+$") then
+  -- Only launch HTTPS or an explicit loopback HTTP development URL whose
+  -- characters cannot break out of (or inject into) that string.
+  if type(url) ~= "string" then return end
+  local safe_https = url:match("^https://[%w%-%._~/%?#%[%]@:=&%%]+$")
+  local safe_local_http = url:match("^http://localhost[:/][%w%-%._~/%?#%[%]@:=&%%]+$")
+    or url:match("^http://127%.0%.0%.1[:/][%w%-%._~/%?#%[%]@:=&%%]+$")
+  if not safe_https and not safe_local_http then
     return
   end
   if reaper.CF_ShellExecute then -- SWS: ShellExecute, no shell parsing — handles any valid URL

@@ -11,6 +11,7 @@ local net     = require("mirelo.net")
 local R       = require("mirelo.reaper_io")
 local wf       = require("mirelo.waveform")
 local vc      = require("mirelo.video_coverage")
+local credits = require("mirelo.credits")
 
 local ui = {}
 
@@ -22,7 +23,12 @@ local M = {
   -- auth
   nonce = nil, connecting = false, auth_msg = "", auth_next = 0, auth_inflight = false,
   -- account
-  capacity = nil, email = nil, me_inflight = false,
+  capacity = nil, credits_available = nil, billing_mode = nil,
+  recovery_action = nil, recovery_url = nil,
+  provisioning_state = "loading", provisioning_deadline = nil,
+  email = nil, me_inflight = false, me_polls = 0, me_next = 0,
+  quote_key = nil, quote_inflight = false, quote_inflight_key = nil, quote_loaded = false,
+  quote_credits = nil, quote_recovery = nil, quote_retry_at = 0,
   -- model registry (GET /v3/models), fetched once per session at sign-in.
   -- Same nil-means-unknown convention as M.capacity: M.limits is set only once
   -- a fetch has actually landed.
@@ -59,24 +65,25 @@ local M = {
   wave = {}, -- path -> {bars, real}
 }
 
--- Duration bounds (seconds) for the two music endpoints, and how many samples
--- they take. There is no music family in v3, so `GET /v3/models` says nothing
--- about music and these stay compiled in; the sfx and video-to-sfx bounds that
--- used to sit beside them now come off the registry.
+-- Duration bounds (seconds) for the two music endpoints, how many samples they
+-- take, and their per-second credit rate. There is no music family in v3, so
+-- `GET /v3/models` says nothing about music and these stay compiled in; the sfx
+-- and video-to-sfx bounds that used to sit beside them now come off the
+-- registry.
 local MUSIC_LIMITS = {
-  music       = { min = 3.0, max = 120.0, samples = 4 },
-  video_music = { min = 3.0, max = 120.0, samples = 4 },
+  music       = { min = 3.0, max = 120.0, samples = 4, rate = 10 },
+  video_music = { min = 3.0, max = 120.0, samples = 4, rate = 10 },
 }
 
--- Floors this plugin deliberately holds ABOVE what the API accepts.
+-- The one floor this plugin deliberately holds ABOVE what the API accepts.
 --
--- The registry can only publish capability. These two are product choices, and
--- @studio/shared/audio-constants is where they are argued: SFX_TEXT_DURATION_
--- SECONDS and SFX_EXTEND_LIMITS both sit above their API counterparts so
--- "interactive surfaces keep enough generated material for a smooth
+-- The registry can only publish capability. The loop-extend floor is a product
+-- choice shared with the Studio, Premiere and Resolve extenders, argued in
+-- SFX_EXTEND_LIMITS (@studio/shared/audio-constants): it sits above the API's
+-- so "interactive surfaces keep enough generated material for a smooth
 -- transition". The effective bound is whichever of the two is stricter, folded
--- in where the registry lands.
-local PRODUCT_FLOORS = { sfx = 1.0, extend_loop = 2.0 }
+-- in where the registry lands. Every other bound is the registry's own.
+local PRODUCT_FLOORS = { extend_loop = 2.0 }
 
 -- Extender bounds the plugin holds itself, because the registry has no field
 -- for either. PREFIX_MIN is a property of the caller's own clip — the model
@@ -94,16 +101,34 @@ local function endpoint_kind()
 end
 
 -- Duration bounds for one endpoint kind. nil while the registry hasn't
--- answered, which only happens on a kind the registry covers.
+-- answered, or doesn't offer this account the model the kind generates with.
 local function dur_limits(kind)
-  return MUSIC_LIMITS[kind] or (M.limits and M.limits.duration[kind])
+  return MUSIC_LIMITS[kind] or (M.limits and M.limits.generate and M.limits.generate.duration[kind])
 end
 
 -- The `num_variants` ceiling for one endpoint kind.
 local function samples_max(kind)
   local music = MUSIC_LIMITS[kind]
   if music then return music.samples end
-  return (M.limits and M.limits.samples[kind]) or 1
+  return (M.limits and M.limits.generate and M.limits.generate.samples[kind]) or 1
+end
+
+-- Credits per second for one endpoint kind: the rate of the model it sends.
+local function credit_rate(kind)
+  local music = MUSIC_LIMITS[kind]
+  if music then return music.rate end
+  return M.limits.rate[kind]
+end
+
+-- The prompt ceiling the current prompt is over, or nil when it fits. Counted
+-- the way the API counts, in code points rather than bytes; a prompt that isn't
+-- valid UTF-8 falls back to bytes, which can only overcount. Music runs on v2,
+-- which publishes no ceiling.
+local function prompt_over(kind)
+  if MUSIC_LIMITS[kind] then return nil end
+  local max_chars = M.limits.generate.prompt_max
+  if (utf8.len(M.prompt) or #M.prompt) > max_chars then return max_chars end
+  return nil
 end
 
 -- A bound as text. These come off the registry now, so a bound is no longer
@@ -128,16 +153,6 @@ local function round1(n) return math.floor(n * 10 + 0.5) / 10 end
 local function commas(n)
   local s = string.format("%d", math.floor((n or 0) + 0.5))
   return (s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
-end
-
--- Credit cost: ceil(duration * samples * rate). All v1.6/v1.0 models bill at 10/s.
-local CREDIT_RATE = 10
-local function credits_for(dur, samples) return math.ceil(dur * (samples or 1) * CREDIT_RATE) end
--- spend_capacity is the answer to exactly this question: the ledger balance,
--- less credits already committed by jobs in flight, plus any enabled overage
--- headroom. Nil on an unmetered key, which is never refused.
-local function enough_credits(needed)
-  return M.capacity == nil or M.capacity >= needed
 end
 
 local function avail_w()
@@ -335,13 +350,82 @@ local function fetch_me()
       return
     end
     if not err and data then
-      -- spend_capacity, not credits_available: the balance reconciles against
-      -- an invoice, the capacity is what the next request may actually spend,
-      -- and this panel only ever asks the second question.
       M.capacity = typed(data.spend_capacity, "number")
+      M.credits_available = typed(data.credits_available, "number")
+      M.billing_mode = typed(data.billing_mode, "string")
+      M.recovery_action = typed(data.recovery_action, "string")
+      M.recovery_url = typed(data.recovery_url, "string")
+      M.provisioning_state = typed(data.provisioning_state, "string") or "loading"
+      M.provisioning_deadline = typed(data.provisioning_deadline, "number")
       M.email = typed(data.email, "string")
     end
+    local fast = M.provisioning_state == "loading" or M.provisioning_state == "pending"
+    if fast and M.me_polls < 30 then
+      M.me_polls = M.me_polls + 1
+      M.me_next = reaper.time_precise() + 2.0
+    else
+      M.me_next = reaper.time_precise() + 600.0
+    end
   end)
+end
+
+local function update_credit_snapshot()
+  if M.provisioning_state == "pending" and M.provisioning_deadline
+      and os.time() * 1000 >= M.provisioning_deadline then
+    M.provisioning_state = "stalled"
+    M.recovery_action = "contact_support"
+    M.recovery_url = "https://mirelo.ai/support"
+  end
+  if M.route == "main" and not M.me_inflight and reaper.time_precise() >= M.me_next then
+    fetch_me()
+  end
+end
+
+local function account_credit_snapshot()
+  return {
+    spend_capacity = M.capacity,
+    billing_mode = M.billing_mode,
+    recovery_action = M.recovery_action,
+    recovery_url = M.recovery_url,
+    provisioning_state = M.provisioning_state,
+    provisioning_deadline = M.provisioning_deadline,
+  }
+end
+
+-- `duration_ms` is the length the request will send, so preflight prices what is billed.
+local function request_credit_decision(kind, duration_ms, samples, loop, fallback_credits)
+  local key = table.concat({ kind, duration_ms, samples or 1, loop and 1 or 0 }, ":")
+  if M.quote_key ~= key then
+    M.quote_key = key
+    M.quote_loaded = false
+    M.quote_credits = nil
+    M.quote_recovery = nil
+    M.quote_retry_at = 0
+    M.quote_inflight = false
+    M.quote_inflight_key = nil
+  end
+  if not M.quote_inflight and not M.quote_loaded
+      and reaper.time_precise() >= M.quote_retry_at then
+    M.quote_inflight = true
+    M.quote_inflight_key = key
+    api.preflight(kind, duration_ms, samples or 1, loop, function(err, data)
+      if M.quote_inflight_key == key then
+        M.quote_inflight = false
+        M.quote_inflight_key = nil
+      end
+      if M.quote_key ~= key then return end
+      if err or type(data) ~= "table" then
+        M.quote_retry_at = reaper.time_precise() + 2.0
+        return
+      end
+      M.quote_loaded = true
+      M.quote_credits = typed(data.credits, "number")
+      M.quote_recovery = credits.recovery_from_preflight(data, store.studio_base())
+    end)
+  end
+  local needed = M.quote_loaded and M.quote_credits or fallback_credits
+  local recovery = M.quote_loaded and M.quote_recovery or nil
+  return needed, credits.decision(account_credit_snapshot(), needed, os.time() * 1000, recovery)
 end
 
 -- ---- model registry ------------------------------------------------------
@@ -382,11 +466,10 @@ start_models_attempt = function()
     -- tore the session down), so its state is gone and must not be revived.
     if epoch ~= M.models_epoch then return end
     M.models_inflight = false
-    local limits = (not err) and api.model_limits(data, api.V3_MODEL) or nil
+    local limits = (not err) and api.model_limits(data) or nil
     if limits then
       -- Fold the bounds the plugin holds itself in here, once, so every read
       -- site downstream sees a single effective bound instead of re-deciding.
-      limits.duration.sfx.min = math.max(limits.duration.sfx.min, PRODUCT_FLOORS.sfx)
       limits.extend.min_with_loop =
         math.max(limits.extend.min_with_loop, PRODUCT_FLOORS.extend_loop)
       -- The append ceiling is bounded by the plugin's own arithmetic as well:
@@ -501,6 +584,12 @@ local function update_auth()
       M.connecting = false
       M.route = "main"
       M.capacity = nil
+      M.credits_available = nil; M.billing_mode = nil
+      M.recovery_action = nil; M.recovery_url = nil
+      M.provisioning_state = "loading"; M.provisioning_deadline = nil
+      M.me_polls = 0; M.me_next = 0
+      M.quote_key = nil; M.quote_inflight = false; M.quote_loaded = false
+      M.quote_inflight_key = nil; M.quote_credits = nil; M.quote_recovery = nil
       fetch_me()
       fetch_models()
     elseif data.status == "expired" then
@@ -528,13 +617,19 @@ local function draw_header()
     ImGui.TextColored(ctx, theme.col.text, "Mirelo")
   end
 
-  -- Right-aligned Feedback / Logout (only when connected).
+  -- Right-aligned Billing / Feedback / Logout (only when connected).
   if M.route == "main" then
     -- Size each button to its label (+ frame padding) so text never clips.
+    local billing_w = math.floor(ImGui.CalcTextSize(ctx, "Billing") + 22)
     local fb_w = math.floor(ImGui.CalcTextSize(ctx, "Feedback") + 22)
     local lo_w = math.floor(ImGui.CalcTextSize(ctx, "Logout") + 22)
     ImGui.SameLine(ctx)
-    ImGui.SetCursorPosX(ctx, ImGui.GetWindowWidth(ctx) - (fb_w + lo_w + 8) - theme.space.panel_pad)
+    ImGui.SetCursorPosX(ctx,
+      ImGui.GetWindowWidth(ctx) - (billing_w + fb_w + lo_w + 16) - theme.space.panel_pad)
+    if card_button("Billing", billing_w) then
+      R.open_url(credits.action_url("enable_overage", store.studio_base()))
+    end
+    ImGui.SameLine(ctx, 0, 8)
     if card_button("Feedback", fb_w) then
       M.feedback_text = ""; M.feedback_status = "idle"; M.feedback_error = ""
       ImGui.OpenPopup(ctx, "Send feedback")
@@ -607,17 +702,16 @@ local function banner(text, kind)
   ImGui.PushStyleColor(ctx, ImGui.Col_Border, is_warn and theme.col.warn_accent or theme.col.info_accent)
   ImGui.PushStyleVar(ctx, ImGui.StyleVar_ChildRounding, 4)
   ImGui.PushStyleVar(ctx, ImGui.StyleVar_WindowPadding, pad, pad)
-  -- BeginChild must always be paired with EndChild, even when it returns false
-  -- (e.g. the child is clipped/scrolled offscreen); otherwise the window stack
-  -- is left unbalanced.
+  -- EndChild only when BeginChild returned true: ReaImGui already ends a child
+  -- it reports as clipped, so a second EndChild would pop the parent window.
   if ImGui.BeginChild(ctx, "##bn" .. banner_seq, w, h, ImGui.ChildFlags_Border or 0) then
     ImGui.PushFont(ctx, theme.fonts.sm)
     ImGui.PushStyleColor(ctx, ImGui.Col_Text, is_warn and theme.col.warn_text or theme.col.info_text)
     ImGui.TextWrapped(ctx, text)
     ImGui.PopStyleColor(ctx, 1)
     ImGui.PopFont(ctx)
+    ImGui.EndChild(ctx)
   end
-  ImGui.EndChild(ctx)
   ImGui.PopStyleVar(ctx, 2)
   ImGui.PopStyleColor(ctx, 2)
 end
@@ -661,19 +755,44 @@ local function hint(text)
   ImGui.PopFont(ctx)
 end
 
+local function recovery_button(action, candidate)
+  local presentation = credits.ACTIONS[action]
+  if not presentation then return end
+  if card_button(presentation.label) then
+    R.open_url(credits.approved_recovery_url(action, candidate, store.studio_base()))
+  end
+end
+
 -- Credit-cost subscript under the generate button (red when insufficient).
-local function credit_line(needed)
+local function credit_line(needed, decision)
   ImGui.PushFont(ctx, theme.fonts.sm)
-  local ok = enough_credits(needed)
+  local ok = decision.allowed
+  local state = decision.state
   ImGui.PushStyleColor(ctx, ImGui.Col_Text, ok and theme.col.text_muted or theme.col.toast_error)
-  -- The capacity, not the ledger balance: this line exists to say whether the
-  -- request will be funded, and those two numbers disagree with overage on or
-  -- with a job of your own in flight. Showing the balance beside a gate that
-  -- reads the capacity is how the line comes to say "available" in red.
-  local avail = M.capacity ~= nil and ("  •  " .. commas(M.capacity) .. " available") or ""
-  ImGui.Text(ctx, string.format("Needs %s credit%s%s", commas(needed), needed == 1 and "" or "s", avail))
+  if state == "loading" then
+    ImGui.Text(ctx, "Checking credits…")
+  elseif state == "pending" then
+    ImGui.Text(ctx, "Setting up your account…")
+  elseif state == "stalled" then
+    ImGui.Text(ctx, "Setup is taking longer than expected")
+  elseif M.billing_mode == "unmetered" then
+    ImGui.Text(ctx, string.format("%s credit%s will be used", commas(needed), needed == 1 and "" or "s"))
+  else
+    local shown_needed = decision and decision.credits_required or needed
+    local shown_available = decision and decision.credits_available or M.credits_available
+    local avail = shown_available ~= nil and commas(shown_available) or "0"
+    local verb = ok and "Uses" or "Needs"
+    local overage = ok and M.capacity and M.credits_available
+      and M.capacity > M.credits_available and needed > M.credits_available
+    ImGui.Text(ctx, string.format("%s %s credit%s  •  %s available%s",
+      verb, commas(shown_needed), shown_needed == 1 and "" or "s", avail,
+      overage and "  •  Overage enabled" or ""))
+  end
   ImGui.PopStyleColor(ctx, 1)
   ImGui.PopFont(ctx)
+  if not ok then
+    recovery_button(decision.recovery_action, decision.recovery_url)
+  end
 end
 
 -- Thin progress bar + stage message, shown while a job is in flight.
@@ -700,6 +819,8 @@ local function draw_gen_error()
   if gen.state.status == "error" and gen.state.error then
     ImGui.Dummy(ctx, 0, 4)
     banner(gen.state.error, "warn")
+    local recovery = gen.state.credit_recovery
+    if recovery then recovery_button(recovery.recovery_action, recovery.recovery_url) end
   end
 end
 
@@ -722,8 +843,8 @@ local function draw_clip_card(clip)
     ImGui.PopStyleColor(ctx, 1)
     ImGui.PopFont(ctx)
     ImGui.PopStyleVar(ctx, 1)
+    ImGui.EndChild(ctx) -- see banner(): only a child that began is ended here
   end
-  ImGui.EndChild(ctx) -- always paired with BeginChild, even when it returns false
   ImGui.PopStyleVar(ctx, 2)
   ImGui.PopStyleColor(ctx, 2)
   ImGui.Dummy(ctx, 0, theme.space.gap_sm)
@@ -766,6 +887,11 @@ local function draw_form()
     M.prompt = txt
     ImGui.PopStyleColor(ctx, 1)
     ImGui.Dummy(ctx, 0, theme.space.gap_sm)
+    local over = prompt_over(kind)
+    if over then
+      banner(string.format("Prompt too long — max %s characters.", commas(over)), "warn")
+      ImGui.Dummy(ctx, 0, theme.space.gap_xs)
+    end
   end
 
   -- Range / duration constraints (driven by the time selection).
@@ -815,10 +941,12 @@ local function draw_form()
   draw_progress()
 
   -- Generate.
-  local needed = credits_for(dur, M.num_samples)
-  local prompt_ok = is_video or (#M.prompt:gsub("%s", "") > 0)
+  local dur_ms = credits.request_ms(dur)
+  local needed, credit_decision = request_credit_decision(
+    kind, dur_ms, M.num_samples, false, credits.quote_ms(dur_ms, M.num_samples, credit_rate(kind)))
+  local prompt_ok = is_video or (#M.prompt:gsub("%s", "") > 0 and not prompt_over(kind))
   local range_ok = raw_len >= lim.min and raw_len <= lim.max and (not is_video or video_count > 0)
-  local can_gen = (not gen.is_busy()) and range_ok and prompt_ok and enough_credits(needed)
+  local can_gen = (not gen.is_busy()) and range_ok and prompt_ok and credit_decision.allowed
   local action_label
   if gen.is_busy() then
     action_label = gen.state.message ~= "" and gen.state.message or "Working…"
@@ -829,19 +957,19 @@ local function draw_form()
   end
   if primary_button(action_label, can_gen) then
     if is_video then
-      gen.start_video(kind, { duration_ms = math.floor(dur * 1000), num_samples = M.num_samples },
+      gen.start_video(kind, { duration_ms = dur_ms, num_samples = M.num_samples },
         ts0, { start = ts0, finish = ts1, len = raw_len })
     else
       gen.start_text(kind, {
         prompt = M.prompt,
-        duration_ms = math.floor(dur * 1000),
+        duration_ms = dur_ms,
         num_samples = M.num_samples,
       }, ts0)
     end
   end
 
   -- Credit cost subscript.
-  if raw_len > 0 then credit_line(needed) end
+  if raw_len > 0 then credit_line(needed, credit_decision) end
   draw_gen_error()
 end
 
@@ -931,8 +1059,8 @@ local function draw_result_card(item, grouped)
     end
   end
 
+  ImGui.EndChild(ctx) -- see banner(): only a child that began is ended here
   end
-  ImGui.EndChild(ctx) -- always paired with BeginChild, even when it returns false
   ImGui.PopStyleVar(ctx, 2)
   ImGui.PopStyleColor(ctx, 1)
   ImGui.Dummy(ctx, 0, 6)
@@ -1137,14 +1265,17 @@ local function draw_extender()
 
   draw_progress()
 
-  local needed = credits_for(M.extension, 1)
-  local can = (not gen.is_busy()) and reason == nil and enough_credits(needed)
+  local quote_kind = eff_video and "extend_video" or "extend"
+  local ext_ms = credits.request_ms(M.extension)
+  local needed, credit_decision = request_credit_decision(
+    quote_kind, ext_ms, 1, eff_loop, credits.quote_ms(ext_ms, 1, credit_rate(quote_kind)))
+  local can = (not gen.is_busy()) and reason == nil and credit_decision.allowed
   local label = gen.is_busy() and (gen.state.message ~= "" and gen.state.message or "Working…")
     or string.format("Extend by %.1fs", M.extension)
   if primary_button(label, can) then
     gen.start_extend({ extension_seconds = M.extension, loop = eff_loop, use_video = eff_video }, clip)
   end
-  credit_line(needed)
+  credit_line(needed, credit_decision)
   draw_gen_error()
 end
 
@@ -1204,12 +1335,19 @@ local function draw_inpainter()
 
   draw_progress()
 
-  local needed = credits_for(source_gap, 1)
-  local can = (not gen.is_busy()) and reason == nil and enough_credits(needed)
+  -- Priced on the region gen.start_inpaint sends, whose ends round on their own.
+  local gap_ms = 0
+  if has_range then
+    local seg_start_ms, seg_end_ms = credits.region_ms(credits.inpaint_segment(clip))
+    gap_ms = seg_end_ms - seg_start_ms
+  end
+  local needed, credit_decision = request_credit_decision(
+    "inpaint", gap_ms, 1, false, credits.quote_ms(gap_ms, 1, credit_rate("inpaint")))
+  local can = (not gen.is_busy()) and reason == nil and credit_decision.allowed
   local label = gen.is_busy() and (gen.state.message ~= "" and gen.state.message or "Working…")
     or "Inpaint selection"
   if primary_button(label, can) then gen.start_inpaint(clip) end
-  credit_line(needed)
+  credit_line(needed, credit_decision)
   draw_gen_error()
 end
 
@@ -1222,6 +1360,12 @@ local function logout()
   gen.reset()
   store.clear_api_key()
   M.route = "auth"; M.connecting = false; M.capacity = nil
+  M.credits_available = nil; M.billing_mode = nil
+  M.recovery_action = nil; M.recovery_url = nil
+  M.provisioning_state = "loading"; M.provisioning_deadline = nil
+  M.me_polls = 0; M.me_next = 0
+  M.quote_key = nil; M.quote_inflight = false; M.quote_loaded = false
+  M.quote_inflight_key = nil; M.quote_credits = nil; M.quote_recovery = nil
   M.wave = {}; M.play_idx = nil
   -- net.reset() dropped any in-flight requests, so their callbacks won't run.
   -- Reset the flags those callbacks would have cleared, or the next session gets
@@ -1375,6 +1519,11 @@ local function draw_main()
   -- it stays usable while the registry is still loading or has given up.
   if M.mode ~= "music" and M.models_status ~= "ready" then
     draw_models_gate()
+  elseif M.mode == "sfx" and not M.limits.generate then
+    -- v3 lists a gated model only to an account that holds it. There is no
+    -- fallback to the edit model: text and video generate with
+    -- api.GENERATE_MODEL or not at all.
+    banner("SFX 2.0 isn't available on this account yet.", "warn")
   elseif M.mode == "extend" then
     draw_extender()
   elseif M.mode == "inpaint" then
@@ -1425,6 +1574,7 @@ end
 -- Called once per frame between Begin/End.
 function ui.draw()
   gen.update()
+  update_credit_snapshot()
   -- On the busy -> done transition: refresh credits (the job just spent some) and
   -- surface a partial-sample failure once, rather than completing silently.
   local busy = gen.is_busy()

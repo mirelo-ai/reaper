@@ -1,5 +1,5 @@
 -- @description Mirelo — AI sound effects & music for REAPER
--- @version 1.2.0
+-- @version 1.3.0
 -- @author Mirelo
 -- @link Website https://mirelo.ai
 -- @provides
@@ -19,9 +19,13 @@
 --
 --   Run the "Mirelo" action to open the dockable window, then connect your account.
 -- @changelog
---   - The duration, extension and inpaint limits now come from Mirelo when you sign in, instead of being built into the plugin. A limit that moves on our side reaches you without an update.
---   - While those limits are loading the generation form waits, and if Mirelo cannot be reached it says so and offers a retry. It no longer shows controls whose limits it had to guess and then refuses the generation.
---   - Music is unaffected by either and stays usable throughout.
+--   - Sound effects from a prompt or from your video now use Mirelo's new SFX 2.0 model, and a selection can run up to ten minutes. Extend, inpaint and loop keep using the current model.
+--   - Sound from video leaves the dialogue in your clip out of the generated audio, so it doesn't play twice beside your original track.
+--   - Sound from video and video-guided extend now work on macOS. They used to stop with a render error.
+--   - A prompt longer than the model accepts is flagged before you generate, instead of being refused afterwards.
+--   - Long selections no longer time out while uploading, generating or downloading on a slower connection.
+--   - The window no longer closes with an error when your results don't fit in it.
+--   - When you run short of credits, the panel shows what the generation needs and a button to fix it, and the estimate no longer rounds up by a credit.
 
 -- Mirelo for REAPER — pure ReaScript + ReaImGui edition.
 -- Single-script companion: no Electron, no bridge process, no installer.
@@ -134,12 +138,14 @@ local function loop()
   push_style()
   ImGui.SetNextWindowSize(ctx, 360, 640, ImGui.Cond_FirstUseEver)
   local visible, open = ImGui.Begin(ctx, "Mirelo", true)
+  -- End only when Begin returned true: ReaImGui already ends a collapsed or
+  -- clipped window, and a second End would unbalance the window stack.
   if visible then
     ImGui.PushFont(ctx, theme.fonts.base)
     ui.draw()
     ImGui.PopFont(ctx)
+    ImGui.End(ctx)
   end
-  ImGui.End(ctx) -- always paired with Begin, even when collapsed (visible == false)
   pop_style()
 
   if open then

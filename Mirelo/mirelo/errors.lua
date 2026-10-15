@@ -27,7 +27,7 @@ local CODES = {
   audio_format_unsupported = { m = "That audio format isn't supported. Try exporting as WAV and re-import.", c = "asset" },
   video_too_short = { m = "The selected range is too short. Pick a longer region (at least one second).", c = "validation" },
   audio_too_short = { m = "The selected audio range is too short. Pick a longer region (at least one second).", c = "validation" },
-  audio_too_long = { m = "The selected audio range is too long. Trim it to under ten minutes and try again.", c = "validation" },
+  audio_too_long = { m = "The selected audio range is too long. Trim it to 30 minutes or less and try again.", c = "validation" },
   invalid_request = { m = "The request was rejected. Double-check the selection and try again.", c = "validation", server = true },
   server_error = { m = "Mirelo is having trouble right now. Wait a moment and try again.", c = "server" },
   -- Both are reported inside a 200 poll as well as as a status, so they need
